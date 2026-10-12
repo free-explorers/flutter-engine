@@ -1,27 +1,23 @@
 name: Engine Release
 
 # Builds and publishes the portable Flutter engine SDK that Veshell's distro
-# recipes and dev build consume, replacing the meta-flutter binaries.
+# recipes and dev build consume.
 #
 # This file belongs in the dedicated engine repository
 # (free-explorers/flutter-engine), NOT in free-explorers/veshell: engine
 # releases are versioned by engine revision and must not be mixed with
-# application releases. The rest of packaging/engine/ (build-engine.sh,
-# patches/, README.md) is that repository's content; copy it to the engine
-# repository's root and place this file at its .github/workflows/.
+# application releases.
 #
-# It is expensive (a multi-gigabyte checkout and a multi-hour gn/ninja build),
-# so it is workflow_dispatch only and never runs as part of an app release.
+# The modes build in parallel (one matrix job each). `release` ships in every
+# distro package; `debug` and `profile` are what `cargo run` fetches for local
+# development, so a checkout can run without a release-mode workaround.
+#
+# It is expensive (a multi-gigabyte checkout and a multi-hour gn/ninja build per
+# mode), so it is workflow_dispatch only and never runs as part of an app release.
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: Runtime mode to build
-        required: true
-        type: choice
-        options: [release, debug, profile, debug-unopt]
-        default: release
       revision:
         description: Flutter engine revision (SDK bin/internal/engine.version)
         required: true
@@ -40,15 +36,20 @@ jobs:
     if: github.repository == 'free-explorers/flutter-engine'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        mode: [release, debug, profile]
     permissions:
       contents: write
       id-token: write
       attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
-      MODE: ${{ inputs.mode }}
+      MODE: ${{ matrix.mode }}
       REVISION: ${{ inputs.revision }}
-      ASSET: linux-engine-sdk-${{ inputs.mode }}-x86_64-${{ inputs.revision }}
+      ASSET: linux-engine-sdk-${{ matrix.mode }}-x86_64-${{ inputs.revision }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -100,22 +101,14 @@ jobs:
             --title "$ASSET" --prerelease --latest=false \
             --notes "Source-built Linux x86_64 Flutter engine SDK ($MODE) for engine revision $REVISION."
 
-      - name: Record the manifest update
+      - name: Record the release
         shell: bash
         run: |
           set -euo pipefail
           sha="$(cut -d' ' -f1 "dist/$ASSET.tar.gz.sha256")"
           {
-            echo "## Engine SDK built"
+            echo "## $ASSET"
             echo
-            echo "Tag: \`$ASSET\`"
-            echo
-            echo "Point \`packaging/release.json\` at it:"
-            echo
-            echo '```json'
-            echo '"engine": {'
-            echo "  \"url\": \"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$ASSET/$ASSET.tar.gz\","
-            echo "  \"sha256\": \"$sha\""
-            echo '}'
-            echo '```'
+            echo "url: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$ASSET/$ASSET.tar.gz"
+            echo "sha256: $sha"
           } >> "$GITHUB_STEP_SUMMARY"
