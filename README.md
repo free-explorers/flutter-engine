@@ -8,12 +8,16 @@ arm64, in the release, debug and profile runtime modes.
 ## What is built
 
 Flutter's engine at a given revision (the SDK's `bin/internal/engine.version`),
-with the patches of [`patches/`](patches) applied in order:
+with the engine patches of [`patches/`](patches) applied in order:
 
-- `0001-clang-toolchain.patch`: use the LLVM binutils of Flutter's own clang
-  toolchain.
 - `0002-embedder-partial-repaint-with-a-compositor.patch`: partial repaint for
   embedders that composite with `FlutterCompositor`.
+
+They are the single source of Veshell's engine changes: the Nix build
+([free-explorers/flutter-engine-nix](https://github.com/free-explorers/flutter-engine-nix))
+applies the same files, pinned by revision. The patches of
+[`toolchain/`](toolchain) only adapt this build (the LLVM binutils of Flutter's
+own clang toolchain) and are not part of the engine.
 
 [`PATCHSET`](PATCHSET) names this set of patches. The engine is not upstream's,
 so every artifact carries it:

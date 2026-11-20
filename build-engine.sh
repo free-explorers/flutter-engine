@@ -2,7 +2,8 @@
 # build-engine.sh - build a portable Flutter engine SDK from source.
 #
 # This follows the Linux builds in meta-flutter/flutter-engine (Apache-2.0;
-# see README.md for provenance), with the patches of patches/ applied:
+# see README.md for provenance), with the engine patches of patches/ applied,
+# and the build's own toolchain patch (toolchain/):
 #
 #   linux-engine-sdk-<mode>-<arch>-<revision>-<patchset>.tar.gz
 #   linux-engine-sdk-<mode>-<arch>-<revision>-<patchset>.tar.gz.sha256
@@ -91,7 +92,9 @@ log "Installing the $target_sysroot sysroot"
   build/linux/sysroot_scripts/install-sysroot.py --arch="$arch"
 )
 
-for patch_file in "$script_dir"/patches/*.patch; do
+# patches/ changes the engine, and is shared with the Nix build
+# (free-explorers/flutter-engine-nix); toolchain/ only adapts this build.
+for patch_file in "$script_dir"/toolchain/*.patch "$script_dir"/patches/*.patch; do
   log "Applying $(basename "$patch_file")"
   if ! ( cd "$work/flutter" && git apply "$patch_file" ); then
     if ( cd "$work/flutter" && git apply --reverse --check "$patch_file" ); then
