@@ -1,33 +1,62 @@
 # flutter-engine
-Flutter Engine Artifacts
 
-## engine sdk
+Source-built Linux Flutter engine SDKs for
+[Veshell](https://github.com/free-explorers/veshell): the embedder library
+(`libflutter_engine.so`) and its header (`flutter_embedder.h`), for x86_64 and
+arm64, in the release, debug and profile runtime modes.
 
-Contains libraries and tools for running Embedded Flutter on Linux
+## What is built
+
+Flutter's engine at a given revision (the SDK's `bin/internal/engine.version`),
+with the patches of [`patches/`](patches) applied in order:
+
+- `0001-clang-toolchain.patch`: use the LLVM binutils of Flutter's own clang
+  toolchain.
+- `0002-embedder-partial-repaint-with-a-compositor.patch`: partial repaint for
+  embedders that composite with `FlutterCompositor`.
+
+[`PATCHSET`](PATCHSET) names this set of patches. The engine is not upstream's,
+so every artifact carries it:
+
+```
+linux-engine-sdk-<mode>-<arch>-<revision>-<patchset>.tar.gz
+linux-engine-sdk-<mode>-<arch>-<revision>-<patchset>.tar.gz.sha256
+```
+
+Veshell pins the same value (`flutter_engine_patchset` in its `Cargo.toml`).
+Whenever `patches/` changes, bump `PATCHSET` and Veshell's pin together.
+
+The libraries are built against the Debian bullseye sysroot, so they run on
+current Debian, Fedora and Arch. arm64 is cross-compiled from x86_64.
+
+## Building
+
+The [Engine Release](.github/workflows/engine-release.yml) workflow builds every
+mode and architecture in parallel and publishes one release per artifact. It
+is started by hand, or by Veshell's Flutter bump, with the engine revision.
+
+Locally:
+
+```sh
+./build-engine.sh release x86_64 <revision> dist
+```
+
+The checkout and the build need tens of GB.
 
 ## Download and checksum validation
 
-Example download
-```
-arch=armv7hf
-commit=c9b9d5780da342eb3f0f5e439a7db06f7d112575
-runtime=debug
-curl -L -O https://github.com/meta-flutter/flutter-engine/releases/download/linux-engine-sdk-$runtime-$arch-$commit/linux-engine-sdk-$runtime-$arch-$commit.tar.gz
-curl -L -O https://github.com/meta-flutter/flutter-engine/releases/download/linux-engine-sdk-$runtime-$arch-$commit/linux-engine-sdk-$runtime-$arch-$commit.tar.gz.sha256
-sha256sum -c linux-engine-sdk-$runtime-$arch-$commit.tar.gz.sha256
+```sh
+asset=linux-engine-sdk-release-x86_64-<revision>-<patchset>
+curl -L -O https://github.com/free-explorers/flutter-engine/releases/download/$asset/$asset.tar.gz
+curl -L -O https://github.com/free-explorers/flutter-engine/releases/download/$asset/$asset.tar.gz.sha256
+sha256sum -c $asset.tar.gz.sha256
 ```
 
-If the downloaded files are good you will see
-```
-linux-engine-sdk-debug-unopt-arm64-c9b9d5780da342eb3f0f5e439a7db06f7d112575.tar.gz: OK
-```
+Never use a binary artifact you cannot check against its expected checksum.
 
-Never use a binary build artifact from a server that you cannot validate the expected checksum.  It's there for a reason, use it.
+## Provenance
 
-## glibc version issue issues
-
-When running binaries on your Linux host, if it fails to execute due to interpreter error you can use the following pattern:
-```
-unshare -mr chroot $(pwd)/engine-sdk/clang_x64 /bin/gen_snapshot --version
-Dart SDK version: 3.5.2 (stable) (Wed Aug 28 10:01:20 2024 +0000) on "linux_x64"
-```
+The build follows the Linux builds of
+[meta-flutter/flutter-engine](https://github.com/meta-flutter/flutter-engine)
+(Apache-2.0), from which this repository was forked, including its clang
+toolchain patch.

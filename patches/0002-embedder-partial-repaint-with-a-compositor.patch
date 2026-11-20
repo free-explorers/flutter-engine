@@ -1,0 +1,358 @@
+From d55487a39684052fc51df0bbb9ddf25f358e592f Mon Sep 17 00:00:00 2001
+From: PapyElGringo <adrien@pesler.be>
+Date: Fri, 20 Nov 2026 22:37:43 +0100
+Subject: [PATCH] [embedder] Partial repaint with a compositor
+
+With an external view embedder, the rasterizer repaints every frame
+whole: it only diffs against the previous layer tree for surfaces that
+report their existing damage, which embedder views never do.
+
+FlutterCompositor gains an optional populate_view_existing_damage_callback.
+Before rasterizing a view, the engine asks the embedder whether the
+render target it is about to get still holds the view's previous frame
+(plus any damage it lists). When it does, the rasterizer diffs against
+the previous layer tree and paints only what changed, clipped to it. The
+region painted is reported in FlutterPresentViewInfo.painted_region, so
+the embedder can copy and composite only that.
+
+Without the callback, or with a root surface transformation, nothing
+changes. Platform views are not supported by this path.
+---
+ engine/src/flutter/flow/embedded_views.h      | 11 ++++
+ engine/src/flutter/shell/common/rasterizer.cc | 16 +++++-
+ .../shell/platform/embedder/embedder.cc       | 51 +++++++++++++++++--
+ .../shell/platform/embedder/embedder.h        | 33 ++++++++++++
+ .../embedder_external_view_embedder.cc        | 30 +++++++++--
+ .../embedder_external_view_embedder.h         | 20 +++++++-
+ 6 files changed, 152 insertions(+), 9 deletions(-)
+
+diff --git a/engine/src/flutter/flow/embedded_views.h b/engine/src/flutter/flow/embedded_views.h
+index 0800e71ce2..62b046a637 100644
+--- a/engine/src/flutter/flow/embedded_views.h
++++ b/engine/src/flutter/flow/embedded_views.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_FLOW_EMBEDDED_VIEWS_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <variant>
+ #include <vector>
+@@ -446,6 +447,16 @@ class ExternalViewEmbedder {
+   // explicitly deallocated.
+   virtual void CollectView(int64_t view_id);
+ 
++  // The part of `view_id`'s render target that does not hold the view's
++  // previous frame, before the rasterizer paints the next one.
++  //
++  // A value lets the rasterizer repaint only what changed since that frame
++  // (plus this damage) and tells the embedder what it painted. `std::nullopt`,
++  // the default, repaints the whole view every frame.
++  virtual std::optional<DlIRect> GetExistingDamage(int64_t view_id) {
++    return std::nullopt;
++  }
++
+   // Usually, the root canvas is not owned by the view embedder. However, if
+   // the view embedder wants to provide a canvas to the rasterizer, it may
+   // return one here. This canvas takes priority over the canvas materialized
+diff --git a/engine/src/flutter/shell/common/rasterizer.cc b/engine/src/flutter/shell/common/rasterizer.cc
+index d60c9226b8..9207b30102 100644
+--- a/engine/src/flutter/shell/common/rasterizer.cc
++++ b/engine/src/flutter/shell/common/rasterizer.cc
+@@ -796,9 +796,23 @@ DrawSurfaceStatus Rasterizer::DrawToSurfaceUnsafe(
+     NOT_SLIMPELLER(compositor_context_->raster_cache().BeginFrame());
+ 
+     std::unique_ptr<FrameDamage> damage;
++    // An external view embedder renders the frame into render targets of its
++    // own, so the surface frame says nothing of what they hold: the embedder
++    // does, when it supports partial repaint.
++    std::optional<DlIRect> embedder_existing_damage;
++    if (external_view_embedder_ &&
++        (!raster_thread_merger_ || raster_thread_merger_->IsMerged())) {
++      embedder_existing_damage =
++          external_view_embedder_->GetExistingDamage(view_id);
++    }
+     // when leaf layer tracing is enabled we wish to repaint the whole frame
+     // for accurate performance metrics.
+-    if (frame->framebuffer_info().supports_partial_repaint) {
++    if (embedder_existing_damage.has_value()) {
++      damage = std::make_unique<FrameDamage>();
++      damage->SetPreviousLayerTree(GetLastLayerTree(view_id));
++      damage->AddAdditionalDamage(embedder_existing_damage.value());
++      damage->SetClipAlignment(1, 1);
++    } else if (frame->framebuffer_info().supports_partial_repaint) {
+       // Disable partial repaint if external_view_embedder_ SubmitFlutterView is
+       // involved - ExternalViewEmbedder unconditionally clears the entire
+       // surface and also partial repaint with platform view present is
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder.cc b/engine/src/flutter/shell/platform/embedder/embedder.cc
+index 44b2ac9f48..a946208de4 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder.cc
+@@ -5,9 +5,11 @@
+ #define FML_USED_ON_EMBEDDER
+ #define RAPIDJSON_HAS_STDSTRING 1
+ 
++#include <cmath>
+ #include <cstring>
+ #include <iostream>
+ #include <memory>
++#include <optional>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -1592,7 +1594,8 @@ InferExternalViewEmbedderFromArgs(const FlutterCompositor* compositor,
+   flutter::EmbedderExternalViewEmbedder::PresentCallback present_callback;
+   if (c_present_callback) {
+     present_callback = [c_present_callback, user_data = compositor->user_data](
+-                           FlutterViewId view_id, const auto& layers) {
++                           FlutterViewId view_id, const auto& layers,
++                           const auto& painted) {
+       TRACE_EVENT0("flutter", "FlutterCompositorPresentLayers");
+       return c_present_callback(const_cast<const FlutterLayer**>(layers.data()),
+                                 layers.size(), user_data);
+@@ -1601,24 +1604,66 @@ InferExternalViewEmbedderFromArgs(const FlutterCompositor* compositor,
+     FML_DCHECK(c_present_view_callback != nullptr);
+     present_callback = [c_present_view_callback,
+                         user_data = compositor->user_data](
+-                           FlutterViewId view_id, const auto& layers) {
++                           FlutterViewId view_id, const auto& layers,
++                           const std::optional<flutter::DlIRect>& painted) {
+       TRACE_EVENT0("flutter", "FlutterCompositorPresentLayers");
+ 
++      FlutterRect painted_region = {};
++      if (painted.has_value()) {
++        painted_region = {
++            .left = static_cast<double>(painted->GetLeft()),
++            .top = static_cast<double>(painted->GetTop()),
++            .right = static_cast<double>(painted->GetRight()),
++            .bottom = static_cast<double>(painted->GetBottom()),
++        };
++      }
+       FlutterPresentViewInfo info = {
+           .struct_size = sizeof(FlutterPresentViewInfo),
+           .view_id = view_id,
+           .layers = const_cast<const FlutterLayer**>(layers.data()),
+           .layers_count = layers.size(),
+           .user_data = user_data,
++          .painted_region = painted.has_value() ? &painted_region : nullptr,
+       };
+ 
+       return c_present_view_callback(&info);
+     };
+   }
+ 
++  // Partial repaint relies on the compositor keeping each view's last frame,
++  // which only the per-view presentation reports updates to.
++  flutter::EmbedderExternalViewEmbedder::ExistingDamageCallback
++      existing_damage_callback;
++  auto c_existing_damage_callback =
++      SAFE_ACCESS(compositor, populate_view_existing_damage_callback, nullptr);
++  if (c_existing_damage_callback && c_present_view_callback) {
++    existing_damage_callback =
++        [c_existing_damage_callback, user_data = compositor->user_data](
++            FlutterViewId view_id) -> std::optional<flutter::DlIRect> {
++      FlutterDamage existing_damage = {
++          .struct_size = sizeof(FlutterDamage),
++          .num_rects = 0,
++          .damage = nullptr,
++      };
++      if (!c_existing_damage_callback(view_id, &existing_damage, user_data)) {
++        return std::nullopt;
++      }
++      flutter::DlIRect damage;
++      for (size_t i = 0; i < existing_damage.num_rects; i++) {
++        const FlutterRect& rect = existing_damage.damage[i];
++        damage = damage.Union(flutter::DlIRect::MakeLTRB(
++            static_cast<int32_t>(std::floor(rect.left)),
++            static_cast<int32_t>(std::floor(rect.top)),
++            static_cast<int32_t>(std::ceil(rect.right)),
++            static_cast<int32_t>(std::ceil(rect.bottom))));
++      }
++      return damage;
++    };
++  }
++
+   return std::make_unique<flutter::EmbedderExternalViewEmbedder>(
+       avoid_backing_store_cache, create_render_target_callback,
+-      present_callback);
++      present_callback, existing_damage_callback);
+ }
+ 
+ // Translates embedder metrics to engine metrics, or returns a string on error.
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder.h b/engine/src/flutter/shell/platform/embedder/embedder.h
+index 0c53cb5169..52271c0e3e 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder.h
+@@ -2280,6 +2280,13 @@ typedef struct {
+ 
+   /// The |FlutterCompositor.user_data|.
+   void* user_data;
++
++  /// The part of the layers' backing stores the engine painted for this frame,
++  /// in physical pixels, when the compositor supports partial repaint (see
++  /// |FlutterCompositor.populate_view_existing_damage_callback|). The rest of
++  /// them holds nothing of this frame: the compositor keeps the view's
++  /// previous frame there. Null when the whole view was painted.
++  const FlutterRect* painted_region;
+ } FlutterPresentViewInfo;
+ 
+ typedef bool (*FlutterBackingStoreCreateCallback)(
+@@ -2301,6 +2308,22 @@ typedef bool (*FlutterLayersPresentCallback)(const FlutterLayer** layers,
+ typedef bool (*FlutterPresentViewCallback)(
+     const FlutterPresentViewInfo* /* present info */);
+ 
++/// Asks the compositor which part of a view no longer holds the view's
++/// previous frame, before the engine paints the next one.
++///
++/// Returning true with an empty damage says the compositor still has all of
++/// the previous frame: the engine paints only what changed since, and reports
++/// it as |FlutterPresentViewInfo.painted_region|. Damage rectangles (in
++/// physical pixels) are repainted as well; set them where the previous frame
++/// was lost, such as all of a view whose frame the compositor dropped. The
++/// rectangles only need to stay valid until the callback returns.
++///
++/// Returning false repaints the whole view.
++typedef bool (*FlutterViewExistingDamageCallback)(
++    FlutterViewId /* view id */,
++    FlutterDamage* /* existing damage */,
++    void* /* user data */);
++
+ typedef struct {
+   /// This size of this struct. Must be sizeof(FlutterCompositor).
+   size_t struct_size;
+@@ -2357,6 +2380,16 @@ typedef struct {
+   ///
+   /// The callback should return true if the operation was successful.
+   FlutterPresentViewCallback present_view_callback;
++  /// Enables partial repaint of views presented through
++  /// `present_view_callback`: when set, the engine asks it for each view's
++  /// existing damage before painting a frame, and paints only that damage and
++  /// what changed since the view's previous frame. The compositor must then
++  /// keep each view's complete last frame itself, and update it with
++  /// |FlutterPresentViewInfo.painted_region| of every frame.
++  ///
++  /// Not supported with platform views or a root surface transformation, nor
++  /// with `present_layers_callback`: views are then repainted whole.
++  FlutterViewExistingDamageCallback populate_view_existing_damage_callback;
+ } FlutterCompositor;
+ 
+ typedef struct {
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.cc
+index 1d3ff65c77..b819dead2e 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.cc
+@@ -23,10 +23,12 @@ static const auto kRootViewIdentifier = EmbedderExternalView::ViewIdentifier{};
+ EmbedderExternalViewEmbedder::EmbedderExternalViewEmbedder(
+     bool avoid_backing_store_cache,
+     const CreateRenderTargetCallback& create_render_target_callback,
+-    const PresentCallback& present_callback)
++    const PresentCallback& present_callback,
++    ExistingDamageCallback existing_damage_callback)
+     : avoid_backing_store_cache_(avoid_backing_store_cache),
+       create_render_target_callback_(create_render_target_callback),
+-      present_callback_(present_callback) {
++      present_callback_(present_callback),
++      existing_damage_callback_(std::move(existing_damage_callback)) {
+   FML_DCHECK(create_render_target_callback_);
+   FML_DCHECK(present_callback_);
+ }
+@@ -37,6 +39,17 @@ void EmbedderExternalViewEmbedder::CollectView(int64_t view_id) {
+   render_target_caches_.erase(view_id);
+ }
+ 
++std::optional<DlIRect> EmbedderExternalViewEmbedder::GetExistingDamage(
++    int64_t view_id) {
++  // Damage is computed in the layer tree's coordinates, which are the render
++  // target's only without a root surface transformation.
++  if (!existing_damage_callback_ ||
++      !pending_surface_transformation_.IsIdentity()) {
++    return std::nullopt;
++  }
++  return existing_damage_callback_(view_id);
++}
++
+ void EmbedderExternalViewEmbedder::SetSurfaceTransformationCallback(
+     SurfaceTransformationCallback surface_transformation_callback) {
+   surface_transformation_callback_ = std::move(surface_transformation_callback);
+@@ -624,7 +637,18 @@ void EmbedderExternalViewEmbedder::SubmitFlutterView(
+ 
+     builder.PushLayers(presented_layers);
+ 
+-    presented_layers.InvokePresentCallback(flutter_view_id, present_callback_);
++    // What the rasterizer painted. Outside it the render targets hold nothing
++    // of this frame: the embedder keeps the previous one there (see
++    // `GetExistingDamage`).
++    const std::optional<DlIRect> painted =
++        existing_damage_callback_ ? frame->submit_info().buffer_damage
++                                  : std::nullopt;
++    presented_layers.InvokePresentCallback(
++        flutter_view_id,
++        [this, &painted](FlutterViewId view_id,
++                         const std::vector<const FlutterLayer*>& layers) {
++          return present_callback_(view_id, layers, painted);
++        });
+   }
+ 
+   // See why this is necessary in the comment where this collection in
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.h b/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.h
+index 91953a1f7c..aff13a54ce 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_view_embedder.h
+@@ -34,10 +34,17 @@ class EmbedderExternalViewEmbedder final : public ExternalViewEmbedder {
+           GrDirectContext* context,
+           const std::shared_ptr<impeller::AiksContext>& aiks_context,
+           const FlutterBackingStoreConfig& config)>;
++  /// `painted` is the part of the layers' render targets painted this frame;
++  /// `std::nullopt` when all of it was.
+   using PresentCallback =
+       std::function<bool(FlutterViewId view_id,
+-                         const std::vector<const FlutterLayer*>& layers)>;
++                         const std::vector<const FlutterLayer*>& layers,
++                         const std::optional<DlIRect>& painted)>;
+   using SurfaceTransformationCallback = std::function<DlMatrix(void)>;
++  /// The part of a view's render target that does not hold its previous
++  /// frame; `std::nullopt` to repaint the whole view.
++  using ExistingDamageCallback =
++      std::function<std::optional<DlIRect>(FlutterViewId view_id)>;
+ 
+   //----------------------------------------------------------------------------
+   /// @brief      Creates an external view embedder used by the generic embedder
+@@ -55,11 +62,16 @@ class EmbedderExternalViewEmbedder final : public ExternalViewEmbedder {
+   ///                                     collection of layers (backed by
+   ///                                     fulfilled render targets) to the
+   ///                                     embedder for presentation.
++  /// @param[in]  existing_damage_callback  When set, the embedder keeps a
++  ///                                     view's previous frame in its render
++  ///                                     target and reports what it lost, so
++  ///                                     that only damage is repainted.
+   ///
+   EmbedderExternalViewEmbedder(
+       bool avoid_backing_store_cache,
+       const CreateRenderTargetCallback& create_render_target_callback,
+-      const PresentCallback& present_callback);
++      const PresentCallback& present_callback,
++      ExistingDamageCallback existing_damage_callback = nullptr);
+ 
+   //----------------------------------------------------------------------------
+   /// @brief      Collects the external view embedder.
+@@ -69,6 +81,9 @@ class EmbedderExternalViewEmbedder final : public ExternalViewEmbedder {
+   // |ExternalViewEmbedder|
+   void CollectView(int64_t view_id) override;
+ 
++  // |ExternalViewEmbedder|
++  std::optional<DlIRect> GetExistingDamage(int64_t view_id) override;
++
+   //----------------------------------------------------------------------------
+   /// @brief      Sets the surface transformation callback used by the external
+   ///             view embedder to ask the platform for the per frame root
+@@ -115,6 +130,7 @@ class EmbedderExternalViewEmbedder final : public ExternalViewEmbedder {
+   const bool avoid_backing_store_cache_;
+   const CreateRenderTargetCallback create_render_target_callback_;
+   const PresentCallback present_callback_;
++  const ExistingDamageCallback existing_damage_callback_;
+   SurfaceTransformationCallback surface_transformation_callback_;
+   DlISize pending_frame_size_;
+   double pending_device_pixel_ratio_ = 1.0;
+-- 
+2.55.0
+

@@ -1,45 +1,65 @@
 #!/usr/bin/env bash
 # build-engine.sh - build a portable Flutter engine SDK from source.
 #
-# This mirrors the Linux x86_64 build in meta-flutter/flutter-engine (Apache-2.0;
-# see README.md for provenance). It produces the same artifact contract as the
-# meta-flutter releases:
+# This follows the Linux builds in meta-flutter/flutter-engine (Apache-2.0;
+# see README.md for provenance), with the patches of patches/ applied:
 #
-#   linux-engine-sdk-<mode>-x86_64-<revision>.tar.gz
-#   linux-engine-sdk-<mode>-x86_64-<revision>.tar.gz.sha256
+#   linux-engine-sdk-<mode>-<arch>-<revision>-<patchset>.tar.gz
+#   linux-engine-sdk-<mode>-<arch>-<revision>-<patchset>.tar.gz.sha256
+#
+# <patchset> is the content of PATCHSET: the engine is not upstream's at
+# <revision>, so its artifacts must not pass for it. Bump PATCHSET whenever
+# patches/ changes.
 #
 # The tarball contains flutter/engine/src/out/<out>/engine-sdk/{include,lib},
 # which is what Veshell's dev build and packaging/scripts/build-veshell.sh read.
 # It is built against the Debian bullseye sysroot so it runs on Debian/Fedora,
 # unlike the Nix engine build (whose outputs are patched to the Nix loader).
+# arm64 is cross-compiled, as Flutter itself does.
 #
-# Usage: build-engine.sh MODE REVISION OUT_DIR [WORK_DIR]
+# Usage: build-engine.sh MODE ARCH REVISION OUT_DIR [WORK_DIR]
 #   MODE      release | debug | profile | debug-unopt
+#   ARCH      x86_64 | arm64
 #   REVISION  Flutter engine revision (SDK bin/internal/engine.version)
 #   OUT_DIR   where the tarball and .sha256 are written
 #   WORK_DIR  scratch checkout (default: $PWD/engine-build)
 set -euo pipefail
 
-mode="${1:?usage: build-engine.sh MODE REVISION OUT_DIR [WORK_DIR]}"
-revision="${2:?usage: build-engine.sh MODE REVISION OUT_DIR [WORK_DIR]}"
-out_dir="${3:?usage: build-engine.sh MODE REVISION OUT_DIR [WORK_DIR]}"
-work="${4:-$PWD/engine-build}"
+usage='usage: build-engine.sh MODE ARCH REVISION OUT_DIR [WORK_DIR]'
+mode="${1:?$usage}"
+target_arch="${2:?$usage}"
+revision="${3:?$usage}"
+out_dir="${4:?$usage}"
+work="${5:-$PWD/engine-build}"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
+patchset="$(tr -d '[:space:]' < "$script_dir/PATCHSET")"
+[[ -n "$patchset" ]] || { printf 'PATCHSET is empty\n' >&2; exit 1; }
 
-arch=x64
-linux_cpu=x64
-target_triple=x86_64-unknown-linux-gnu
-target_sysroot=debian_bullseye_amd64-sysroot
+case "$target_arch" in
+  x86_64)
+    arch=x64
+    linux_cpu=x64
+    target_triple=x86_64-unknown-linux-gnu
+    target_sysroot=debian_bullseye_amd64-sysroot
+    ;;
+  arm64)
+    arch=arm64
+    linux_cpu=arm64
+    target_triple=aarch64-unknown-linux-gnu
+    target_sysroot=debian_bullseye_arm64-sysroot
+    ;;
+  *) printf 'unknown architecture: %s\n' "$target_arch" >&2; exit 2 ;;
+esac
 
 case "$mode" in
-  release)     gn_mode=release; out_name=linux_release_x64 ;;
-  debug)       gn_mode=debug;   out_name=linux_debug_x64 ;;
-  profile)     gn_mode=profile; out_name=linux_profile_x64 ;;
-  debug-unopt) gn_mode=debug;   out_name=linux_debug_unopt_x64 ;;
+  release)     gn_mode=release; out_name=linux_release_$linux_cpu ;;
+  debug)       gn_mode=debug;   out_name=linux_debug_$linux_cpu ;;
+  profile)     gn_mode=profile; out_name=linux_profile_$linux_cpu ;;
+  debug-unopt) gn_mode=debug;   out_name=linux_debug_unopt_$linux_cpu ;;
   *) printf 'unknown mode: %s\n' "$mode" >&2; exit 2 ;;
 esac
 
-asset="linux-engine-sdk-${mode}-x86_64-${revision}"
+asset="linux-engine-sdk-${mode}-${target_arch}-${revision}-${patchset}"
 mkdir -p "$out_dir" "$work"
 out_dir="$(cd "$out_dir" && pwd)"
 work="$(cd "$work" && pwd)"
@@ -71,16 +91,17 @@ log "Installing the $target_sysroot sysroot"
   build/linux/sysroot_scripts/install-sysroot.py --arch="$arch"
 )
 
-log "Applying the clang toolchain patch"
-patch_file="$script_dir/patches/0001-clang-toolchain.patch"
-if ! ( cd "$work/flutter" && git apply "$patch_file" ); then
-  if ( cd "$work/flutter" && git apply --reverse --check "$patch_file" ); then
-    log "clang toolchain patch already applied"
-  else
-    printf 'error: could not apply %s\n' "$patch_file" >&2
-    exit 1
+for patch_file in "$script_dir"/patches/*.patch; do
+  log "Applying $(basename "$patch_file")"
+  if ! ( cd "$work/flutter" && git apply "$patch_file" ); then
+    if ( cd "$work/flutter" && git apply --reverse --check "$patch_file" ); then
+      log "$(basename "$patch_file") already applied"
+    else
+      printf 'error: could not apply %s\n' "$patch_file" >&2
+      exit 1
+    fi
   fi
-fi
+done
 
 log "Configuring the $gn_mode build"
 (
