@@ -8,9 +8,13 @@ name: Engine Release
 # releases are versioned by engine revision and must not be mixed with
 # application releases.
 #
-# The modes build in parallel (one matrix job each). `release` ships in every
+# Every mode of every architecture builds in parallel (one matrix job each);
+# arm64 is cross-compiled on the same x86_64 runners. `release` ships in every
 # distro package; `debug` and `profile` are what `cargo run` fetches for local
 # development, so a checkout can run without a release-mode workaround.
+#
+# The engine is upstream's at `revision` with the patches of patches/; the
+# releases are named after PATCHSET too, so they never pass for upstream's.
 #
 # It is expensive (a multi-gigabyte checkout and a multi-hour gn/ninja build per
 # mode), so it is workflow_dispatch only and never runs as part of an app release.
@@ -32,15 +36,16 @@ permissions:
   contents: read
 
 jobs:
-  linux-x86_64:
+  linux:
     if: github.repository == 'free-explorers/flutter-engine'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 6
       matrix:
         mode: [release, debug, profile]
+        arch: [x86_64, arm64]
     permissions:
       contents: write
       id-token: write
@@ -48,13 +53,20 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       MODE: ${{ matrix.mode }}
+      ARCH: ${{ matrix.arch }}
       REVISION: ${{ inputs.revision }}
-      ASSET: linux-engine-sdk-${{ matrix.mode }}-x86_64-${{ inputs.revision }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      - name: Name the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          patchset="$(tr -d '[:space:]' < PATCHSET)"
+          echo "ASSET=linux-engine-sdk-$MODE-$ARCH-$REVISION-$patchset" >> "$GITHUB_ENV"
 
       - name: Reclaim disk for the engine build
         shell: bash
@@ -79,7 +91,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash build-engine.sh "$MODE" "$REVISION" "$PWD/dist" "$RUNNER_TEMP/engine-build"
+          bash build-engine.sh "$MODE" "$ARCH" "$REVISION" "$PWD/dist" "$RUNNER_TEMP/engine-build"
 
       - name: Attest the engine checksum
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v2
@@ -99,7 +111,7 @@ jobs:
             "dist/$ASSET.tar.gz" "dist/$ASSET.tar.gz.sha256" \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$ASSET" --prerelease --latest=false \
-            --notes "Source-built Linux x86_64 Flutter engine SDK ($MODE) for engine revision $REVISION."
+            --notes "Source-built Linux $ARCH Flutter engine SDK ($MODE) for engine revision $REVISION, with the patches of $(tr -d '[:space:]' < PATCHSET)."
 
       - name: Record the release
         shell: bash
@@ -114,7 +126,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Veshell that the artifact is published
-        if: inputs.publish && matrix.mode == 'release'
+        if: inputs.publish && matrix.mode == 'release' && matrix.arch == 'x86_64'
         # A missing or unsuccessful dispatch must not fail a build that worked.
         continue-on-error: true
         env:
