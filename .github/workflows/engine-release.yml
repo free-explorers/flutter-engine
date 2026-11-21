@@ -68,7 +68,21 @@ jobs:
           patchset="$(tr -d '[:space:]' < PATCHSET)"
           echo "ASSET=linux-engine-sdk-$MODE-$ARCH-$REVISION-$patchset" >> "$GITHUB_ENV"
 
+      - name: Skip an engine that is already published
+        if: inputs.publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A release is never overwritten, so building it again is hours of
+          # work for nothing (a bump rerun, or one dispatch per Flutter bump
+          # reaching a revision that was built by hand).
+          if gh release view "$ASSET" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "PUBLISHED=true" >> "$GITHUB_ENV"
+            echo "$ASSET is already published; nothing to build." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Reclaim disk for the engine build
+        if: env.PUBLISHED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -79,6 +93,7 @@ jobs:
           (( available >= 30 * 1024 * 1024 * 1024 ))
 
       - name: Install the build toolchain
+        if: env.PUBLISHED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -88,18 +103,20 @@ jobs:
             xz-utils file libgl1-mesa-dev libegl1-mesa-dev
 
       - name: Build the engine SDK
+        if: env.PUBLISHED != 'true'
         shell: bash
         run: |
           set -euo pipefail
           bash build-engine.sh "$MODE" "$ARCH" "$REVISION" "$PWD/dist" "$RUNNER_TEMP/engine-build"
 
       - name: Attest the engine checksum
+        if: env.PUBLISHED != 'true'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v2
         with:
           subject-path: dist/${{ env.ASSET }}.tar.gz.sha256
 
       - name: Publish the engine release
-        if: inputs.publish
+        if: inputs.publish && env.PUBLISHED != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -114,6 +131,7 @@ jobs:
             --notes "Source-built Linux $ARCH Flutter engine SDK ($MODE) for engine revision $REVISION, with the patches of $(tr -d '[:space:]' < PATCHSET)."
 
       - name: Record the release
+        if: env.PUBLISHED != 'true'
         shell: bash
         run: |
           set -euo pipefail
