@@ -1,0 +1,1497 @@
+From 0f334c797705530bf990c2fd17783ce26bcea59f Mon Sep 17 00:00:00 2001
+From: PapyElGringo <adrien@pesler.be>
+Date: Mon, 23 Nov 2026 12:57:04 +0100
+Subject: [PATCH] [embedder] Damage only what changed in an external texture's
+ new frame
+
+With texture layers left undamaged when their texture has no new frame,
+a texture that does present one still damages its whole area, however
+little of it changed: a blinking text cursor in a window repaints the
+whole window, along with whatever filters it (a blur over it re-runs
+over the whole blurred area).
+
+FlutterEngineMarkExternalTextureFrameAvailableWithInfo takes the size of
+the new frame and its damage (a FlutterDamage, in pixels of the frame),
+the texture counterpart of the existing damage callbacks:
+FlutterEngineMarkExternalTextureFrameAvailable marks a frame damaged as a
+whole. The embedder records each frame's damage on the platform thread;
+the texture takes it on the raster thread with the matching
+MarkNewFrameAvailable, and keeps the damage of its last frames.
+
+A texture reports the damage since a given frame (Texture::GetDamageSince),
+unknown when that frame is too old, when one of the frames since had no
+damage, or when the frame size changed. TextureLayer maps it onto its
+bounds, with a margin for the sampling filter (the whole layer when the
+texture is mipmapped), and adds it with DiffContext::AddLayerDamage, which
+applies the same transform, filter bounds adjustments and culling as layer
+bounds without marking the subtree dirty.
+---
+ engine/src/flutter/common/graphics/texture.h  |  18 ++-
+ engine/src/flutter/flow/diff_context.cc       |  56 +++++--
+ engine/src/flutter/flow/diff_context.h        |  20 ++-
+ .../src/flutter/flow/layers/texture_layer.cc  |  48 +++++-
+ .../src/flutter/flow/layers/texture_layer.h   |   8 +
+ .../flow/layers/texture_layer_unittests.cc    | 122 +++++++++++++++
+ .../src/flutter/flow/testing/mock_texture.h   |   7 +
+ .../flutter/shell/platform/embedder/BUILD.gn  |   3 +
+ .../shell/platform/embedder/embedder.cc       |  52 +++++++
+ .../shell/platform/embedder/embedder.h        |  49 ++++++
+ .../platform/embedder/embedder_engine.cc      |  10 +-
+ .../shell/platform/embedder/embedder_engine.h |   7 +-
+ .../embedder_external_texture_frames.cc       | 111 +++++++++++++
+ .../embedder_external_texture_frames.h        | 132 ++++++++++++++++
+ .../embedder/embedder_external_texture_gl.cc  |  19 ++-
+ .../embedder/embedder_external_texture_gl.h   |  18 ++-
+ .../embedder_external_texture_metal.h         |  18 ++-
+ .../embedder_external_texture_metal.mm        |  22 ++-
+ .../embedder_external_texture_resolver.cc     |  12 +-
+ .../embedder_external_texture_resolver.h      |   9 ++
+ .../embedder_external_texture_vulkan.cc       |  19 ++-
+ .../embedder_external_texture_vulkan.h        |  18 ++-
+ ...edder_external_texture_frames_unittests.cc | 146 ++++++++++++++++++
+ 23 files changed, 875 insertions(+), 49 deletions(-)
+ create mode 100644 engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.cc
+ create mode 100644 engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.h
+ create mode 100644 engine/src/flutter/shell/platform/embedder/tests/embedder_external_texture_frames_unittests.cc
+
+diff --git a/engine/src/flutter/common/graphics/texture.h b/engine/src/flutter/common/graphics/texture.h
+index 6d8dd3abf4..8ded1249a3 100644
+--- a/engine/src/flutter/common/graphics/texture.h
++++ b/engine/src/flutter/common/graphics/texture.h
+@@ -74,9 +74,25 @@ class Texture : public ContextListener {
+   // Called on raster thread.
+   virtual std::optional<uint64_t> GetFrameId() const { return std::nullopt; }
+ 
++  // The part of the texture that changed since it presented frame |frame_id|
++  // (see |GetFrameId|), in pixels of its current frame, which is
++  // |frame_size| pixels large.
++  struct Damage {
++    DlISize frame_size;
++    DlIRect rect;
++  };
++
++  // Returns the damage of the texture since it presented frame |frame_id|, or
++  // std::nullopt, the default, when that is not known: the whole texture is
++  // then damaged.
++  //
++  // Called on raster thread.
++  virtual std::optional<Damage> GetDamageSince(uint64_t frame_id) const {
++    return std::nullopt;
++  }
++
+   int64_t Id() { return id_; }
+ 
+- protected:
+   // Returns a frame identifier that no texture has used yet, for textures
+   // implementing |GetFrameId|.
+   static uint64_t NextFrameId();
+diff --git a/engine/src/flutter/flow/diff_context.cc b/engine/src/flutter/flow/diff_context.cc
+index 278a9e1922..bc257e9d79 100644
+--- a/engine/src/flutter/flow/diff_context.cc
++++ b/engine/src/flutter/flow/diff_context.cc
+@@ -176,26 +176,43 @@ void DiffContext::MarkSubtreeDirty(const DlRect& previous_paint_region) {
+   state_.dirty = true;
+ }
+ 
+-void DiffContext::AddLayerBounds(const DlRect& rect) {
++std::optional<DlRect> DiffContext::MapLayerRect(const DlRect& rect) {
+   // During painting we cull based on non-overriden transform and then
+   // override the transform right before paint. Do the same thing here to get
+   // identical paint rect.
+-  auto transformed_rect = ApplyFilterBoundsAdjustment(MapRect(rect));
+-  if (transformed_rect.IntersectsWithRect(
++  DlRect transformed_rect(rect);
++  state_.matrix_clip.mapRect(&transformed_rect);
++  transformed_rect = ApplyFilterBoundsAdjustment(transformed_rect);
++  if (!transformed_rect.IntersectsWithRect(
+           state_.matrix_clip.GetDeviceCullCoverage())) {
+-    if (state_.integral_transform) {
+-      DisplayListMatrixClipState temp_state = state_.matrix_clip;
+-      MakeTransformIntegral(temp_state);
+-      temp_state.mapRect(rect, &transformed_rect);
+-      transformed_rect = ApplyFilterBoundsAdjustment(transformed_rect);
+-    }
+-    rects_->push_back(transformed_rect);
++    return std::nullopt;
++  }
++  if (state_.integral_transform) {
++    DisplayListMatrixClipState temp_state = state_.matrix_clip;
++    MakeTransformIntegral(temp_state);
++    temp_state.mapRect(rect, &transformed_rect);
++    transformed_rect = ApplyFilterBoundsAdjustment(transformed_rect);
++  }
++  return transformed_rect;
++}
++
++void DiffContext::AddLayerBounds(const DlRect& rect) {
++  auto transformed_rect = MapLayerRect(rect);
++  if (transformed_rect.has_value()) {
++    rects_->push_back(transformed_rect.value());
+     if (IsSubtreeDirty()) {
+-      AddDamage(transformed_rect);
++      AddDamage(transformed_rect.value());
+     }
+   }
+ }
+ 
++void DiffContext::AddLayerDamage(const DlRect& rect) {
++  auto transformed_rect = MapLayerRect(rect);
++  if (transformed_rect.has_value()) {
++    AddDamage(transformed_rect.value());
++  }
++}
++
+ void DiffContext::MarkSubtreeHasTextureLayer() {
+   // Set the has_texture flag on current state and all parent states. That
+   // way we'll know that we can't skip diff for retained layers because
+@@ -299,6 +316,23 @@ bool DiffContext::IsOldLayerTextureFrameCurrent(const Layer* layer,
+          i->second == frame_id.value();
+ }
+ 
++std::optional<Texture::Damage> DiffContext::GetOldLayerTextureDamage(
++    const Layer* layer,
++    int64_t texture_id) const {
++  if (!last_frame_texture_frame_map_ || !texture_registry_) {
++    return std::nullopt;
++  }
++  auto i = last_frame_texture_frame_map_->find(layer->unique_id());
++  if (i == last_frame_texture_frame_map_->end()) {
++    return std::nullopt;
++  }
++  auto texture = texture_registry_->GetTexture(texture_id);
++  if (!texture) {
++    return std::nullopt;
++  }
++  return texture->GetDamageSince(i->second);
++}
++
+ void DiffContext::Statistics::LogStatistics() {
+ #if !FLUTTER_RELEASE
+   FML_TRACE_COUNTER("flutter", "DiffContext", reinterpret_cast<int64_t>(this),
+diff --git a/engine/src/flutter/flow/diff_context.h b/engine/src/flutter/flow/diff_context.h
+index 1645dec098..24de716348 100644
+--- a/engine/src/flutter/flow/diff_context.h
++++ b/engine/src/flutter/flow/diff_context.h
+@@ -10,13 +10,13 @@
+ #include <optional>
+ #include <vector>
+ #include "display_list/utils/dl_matrix_clip_tracker.h"
++#include "flutter/common/graphics/texture.h"
+ #include "flutter/flow/paint_region.h"
+ #include "flutter/fml/macros.h"
+ 
+ namespace flutter {
+ 
+ class Layer;
+-class TextureRegistry;
+ 
+ // Represents area that needs to be updated in front buffer (frame_damage) and
+ // area that is going to be painted to in back buffer (buffer_damage).
+@@ -120,6 +120,13 @@ class DiffContext {
+   // coordinates.
+   void AddLayerBounds(const DlRect& rect);
+ 
++  // Adds the part of a layer that changed to damage, without marking the
++  // subtree dirty: for a layer that paints the same as in previous frame
++  // except for |rect|, such as a texture with a partially damaged new frame.
++  // Rect is in "local" (layer) coordinates, and goes through the same
++  // transform and filter bounds adjustments as layer bounds.
++  void AddLayerDamage(const DlRect& rect);
++
+   // Add entire paint region of retained layer for current subtree. This can
+   // only be used in subtrees that are not dirty, otherwise ancestor transforms
+   // or clips may result in different paint region.
+@@ -180,6 +187,13 @@ class DiffContext {
+   bool IsOldLayerTextureFrameCurrent(const Layer* layer,
+                                      int64_t texture_id) const;
+ 
++  // The damage of texture |texture_id| since the frame associated with
++  // specified layer and previous frame layer tree (see
++  // Texture::GetDamageSince), or std::nullopt when that is not known.
++  std::optional<Texture::Damage> GetOldLayerTextureDamage(
++      const Layer* layer,
++      int64_t texture_id) const;
++
+   // Whether or not a raster cache is being used. If so, we must snap
+   // all transformations to physical pixels if the layer may be raster
+   // cached.
+@@ -255,6 +269,10 @@ class DiffContext {
+ 
+   void MakeTransformIntegral(DisplayListMatrixClipState& matrix_clip);
+ 
++  // Maps |rect|, in local (layer) coordinates, to the device rect the layer
++  // paints, or std::nullopt when it is culled.
++  std::optional<DlRect> MapLayerRect(const DlRect& rect);
++
+   std::shared_ptr<std::vector<DlRect>> rects_;
+   State state_;
+   DlISize frame_size_;
+diff --git a/engine/src/flutter/flow/layers/texture_layer.cc b/engine/src/flutter/flow/layers/texture_layer.cc
+index 1d5ee79a96..46bed77e12 100644
+--- a/engine/src/flutter/flow/layers/texture_layer.cc
++++ b/engine/src/flutter/flow/layers/texture_layer.cc
+@@ -25,12 +25,20 @@ void TextureLayer::Diff(DiffContext* context, const Layer* old_layer) {
+     FML_DCHECK(old_layer);
+     auto prev = old_layer->as_texture_layer();
+     // A texture that identifies its frames is only repainted when it presents
+-    // a new one; any other texture may change on every paint.
++    // a new one, and only where that frame changed when the texture knows;
++    // any other texture may change on every paint.
+     if (prev->offset_ != offset_ || prev->size_ != size_ ||
+         prev->texture_id_ != texture_id_ || prev->freeze_ != freeze_ ||
+-        prev->sampling_ != sampling_ ||
+-        !context->IsOldLayerTextureFrameCurrent(prev, texture_id_)) {
++        prev->sampling_ != sampling_) {
+       context->MarkSubtreeDirty(context->GetOldLayerPaintRegion(prev));
++    } else if (!context->IsOldLayerTextureFrameCurrent(prev, texture_id_)) {
++      auto damage = MapTextureDamage(
++          context->GetOldLayerTextureDamage(prev, texture_id_));
++      if (damage.has_value()) {
++        context->AddLayerDamage(damage.value());
++      } else {
++        context->MarkSubtreeDirty(context->GetOldLayerPaintRegion(prev));
++      }
+     }
+   }
+ 
+@@ -45,6 +53,40 @@ void TextureLayer::Diff(DiffContext* context, const Layer* old_layer) {
+   context->SetLayerTextureFrame(this, texture_id_);
+ }
+ 
++std::optional<DlRect> TextureLayer::MapTextureDamage(
++    const std::optional<Texture::Damage>& damage) const {
++  if (!damage.has_value() || damage->frame_size.IsEmpty()) {
++    return std::nullopt;
++  }
++  if (damage->rect.IsEmpty()) {
++    return DlRect();
++  }
++  // A changed pixel also changes what is sampled around it.
++  int32_t margin;
++  switch (sampling_) {
++    case DlImageSampling::kNearestNeighbor:
++    case DlImageSampling::kLinear:
++      margin = 1;
++      break;
++    case DlImageSampling::kCubic:
++      margin = 2;
++      break;
++    case DlImageSampling::kMipmapLinear:
++      // A mipmap level averages ever larger areas of the texture.
++      return std::nullopt;
++  }
++  auto frame_bounds = DlIRect::MakeSize(damage->frame_size);
++  auto rect =
++      damage->rect.Expand(margin, margin).IntersectionOrEmpty(frame_bounds);
++  // The whole frame is stretched over the layer bounds.
++  DlScalar scale_x = size_.width / damage->frame_size.width;
++  DlScalar scale_y = size_.height / damage->frame_size.height;
++  return DlRect::MakeLTRB(offset_.x + rect.GetLeft() * scale_x,
++                          offset_.y + rect.GetTop() * scale_y,
++                          offset_.x + rect.GetRight() * scale_x,
++                          offset_.y + rect.GetBottom() * scale_y);
++}
++
+ void TextureLayer::Preroll(PrerollContext* context) {
+   set_paint_bounds(DlRect::MakeOriginSize(offset_, size_));
+   context->has_texture_layer = true;
+diff --git a/engine/src/flutter/flow/layers/texture_layer.h b/engine/src/flutter/flow/layers/texture_layer.h
+index 22e75e3acc..8d94d3af5e 100644
+--- a/engine/src/flutter/flow/layers/texture_layer.h
++++ b/engine/src/flutter/flow/layers/texture_layer.h
+@@ -5,6 +5,9 @@
+ #ifndef FLUTTER_FLOW_LAYERS_TEXTURE_LAYER_H_
+ #define FLUTTER_FLOW_LAYERS_TEXTURE_LAYER_H_
+ 
++#include <optional>
++
++#include "flutter/common/graphics/texture.h"
+ #include "flutter/flow/layers/layer.h"
+ 
+ namespace flutter {
+@@ -29,6 +32,11 @@ class TextureLayer : public Layer {
+   void Paint(PaintContext& context) const override;
+ 
+  private:
++  // Maps the damage of the texture to the area of this layer it repaints,
++  // or std::nullopt when the whole layer must be repainted.
++  std::optional<DlRect> MapTextureDamage(
++      const std::optional<Texture::Damage>& damage) const;
++
+   DlPoint offset_;
+   DlSize size_;
+   int64_t texture_id_;
+diff --git a/engine/src/flutter/flow/layers/texture_layer_unittests.cc b/engine/src/flutter/flow/layers/texture_layer_unittests.cc
+index 31499dfbf7..339dc6fd89 100644
+--- a/engine/src/flutter/flow/layers/texture_layer_unittests.cc
++++ b/engine/src/flutter/flow/layers/texture_layer_unittests.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "flutter/flow/layers/texture_layer.h"
+ 
++#include "flutter/flow/layers/transform_layer.h"
++
+ #include "flutter/flow/testing/diff_context_test.h"
+ #include "flutter/flow/testing/layer_test.h"
+ #include "flutter/flow/testing/mock_layer.h"
+@@ -216,6 +218,126 @@ TEST_F(TextureLayerDiffTest, ReplacedTextureIsDamaged) {
+   EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
+ }
+ 
++TEST_F(TextureLayerDiffTest, TextureDamageIsMappedToTheLayer) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  // A 200x100 frame shown at half its size.
++  auto make_layer = [] {
++    return std::make_shared<TextureLayer>(DlPoint(10, 10), DlSize(100, 50), 0,
++                                          false, DlImageSampling::kLinear);
++  };
++  MockLayerTree tree1;
++  tree1.root()->Add(make_layer());
++  DiffLayerTree(tree1, MockLayerTree());
++
++  texture->MarkNewFrameAvailable();
++  texture->set_damage(Texture::Damage{
++      .frame_size = DlISize(200, 100),
++      .rect = DlIRect::MakeLTRB(20, 20, 40, 40),
++  });
++  MockLayerTree tree2;
++  tree2.root()->Add(make_layer());
++  auto damage = DiffLayerTree(tree2, tree1);
++  // One more pixel around the damage for linear sampling: (19, 19, 41, 41),
++  // halved and offset by the layer.
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(19, 19, 31, 31));
++}
++
++TEST_F(TextureLayerDiffTest, TextureDamageFollowsTransform) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  auto make_transform = [] {
++    auto transform = std::make_shared<TransformLayer>(
++        DlMatrix::MakeTranslation({100, 200}));
++    transform->Add(std::make_shared<TextureLayer>(
++        DlPoint(), DlSize(100, 100), 0, false,
++        DlImageSampling::kNearestNeighbor));
++    return transform;
++  };
++  auto transform1 = make_transform();
++  MockLayerTree tree1;
++  tree1.root()->Add(transform1);
++  DiffLayerTree(tree1, MockLayerTree());
++
++  texture->MarkNewFrameAvailable();
++  texture->set_damage(Texture::Damage{
++      .frame_size = DlISize(100, 100),
++      .rect = DlIRect::MakeLTRB(10, 10, 20, 20),
++  });
++  auto transform2 = make_transform();
++  transform2->AssignOldLayer(transform1.get());
++  MockLayerTree tree2;
++  tree2.root()->Add(transform2);
++  auto damage = DiffLayerTree(tree2, tree1);
++  // One more pixel around the damage, translated.
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(109, 209, 121, 221));
++}
++
++TEST_F(TextureLayerDiffTest, EmptyTextureDamageDamagesNothing) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  tree1.root()->Add(MakeTextureLayer(0));
++  DiffLayerTree(tree1, MockLayerTree());
++
++  texture->MarkNewFrameAvailable();
++  texture->set_damage(Texture::Damage{
++      .frame_size = DlISize(100, 100),
++      .rect = DlIRect(),
++  });
++  MockLayerTree tree2;
++  tree2.root()->Add(MakeTextureLayer(0));
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_TRUE(damage.frame_damage.IsEmpty());
++}
++
++TEST_F(TextureLayerDiffTest, UnknownTextureDamageDamagesTheWholeLayer) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  tree1.root()->Add(MakeTextureLayer(0));
++  DiffLayerTree(tree1, MockLayerTree());
++
++  texture->MarkNewFrameAvailable();
++  texture->set_damage(std::nullopt);
++  MockLayerTree tree2;
++  tree2.root()->Add(MakeTextureLayer(0));
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++}
++
++TEST_F(TextureLayerDiffTest, MipmappedTextureDamageDamagesTheWholeLayer) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  auto make_layer = [] {
++    return std::make_shared<TextureLayer>(DlPoint(), DlSize(100, 100), 0, false,
++                                          DlImageSampling::kMipmapLinear);
++  };
++  MockLayerTree tree1;
++  tree1.root()->Add(make_layer());
++  DiffLayerTree(tree1, MockLayerTree());
++
++  texture->MarkNewFrameAvailable();
++  texture->set_damage(Texture::Damage{
++      .frame_size = DlISize(100, 100),
++      .rect = DlIRect::MakeLTRB(10, 10, 20, 20),
++  });
++  MockLayerTree tree2;
++  tree2.root()->Add(make_layer());
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++}
++
+ TEST_F(TextureLayerTest, OpacityInheritance) {
+   const DlPoint layer_offset = DlPoint();
+   const DlSize layer_size = DlSize(8.0f, 8.0f);
+diff --git a/engine/src/flutter/flow/testing/mock_texture.h b/engine/src/flutter/flow/testing/mock_texture.h
+index 099ab569b3..df026aadfa 100644
+--- a/engine/src/flutter/flow/testing/mock_texture.h
++++ b/engine/src/flutter/flow/testing/mock_texture.h
+@@ -38,6 +38,12 @@ class MockTexture : public Texture {
+     }
+   }
+   std::optional<uint64_t> GetFrameId() const override { return frame_id_; }
++  std::optional<Damage> GetDamageSince(uint64_t frame_id) const override {
++    return damage_;
++  }
++
++  // Sets the damage |GetDamageSince| returns, whatever the frame.
++  void set_damage(std::optional<Damage> damage) { damage_ = damage; }
+ 
+   // Makes the texture identify its frames (see Texture::GetFrameId), which
+   // it does not by default.
+@@ -54,6 +60,7 @@ class MockTexture : public Texture {
+   bool gr_context_destroyed_ = false;
+   bool unregistered_ = false;
+   std::optional<uint64_t> frame_id_;
++  std::optional<Damage> damage_;
+ };
+ 
+ }  // namespace testing
+diff --git a/engine/src/flutter/shell/platform/embedder/BUILD.gn b/engine/src/flutter/shell/platform/embedder/BUILD.gn
+index de0588a785..68951169e1 100644
+--- a/engine/src/flutter/shell/platform/embedder/BUILD.gn
++++ b/engine/src/flutter/shell/platform/embedder/BUILD.gn
+@@ -60,6 +60,8 @@ template("embedder_source_set") {
+       "embedder.cc",
+       "embedder_engine.cc",
+       "embedder_engine.h",
++      "embedder_external_texture_frames.cc",
++      "embedder_external_texture_frames.h",
+       "embedder_external_texture_resolver.cc",
+       "embedder_external_texture_resolver.h",
+       "embedder_external_view.cc",
+@@ -386,6 +388,7 @@ if (enable_unittests) {
+     include_dirs = [ "." ]
+ 
+     sources = [
++      "tests/embedder_external_texture_frames_unittests.cc",
+       "tests/embedder_frozen_unittests.cc",
+       "tests/embedder_unittests.cc",
+     ]
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder.cc b/engine/src/flutter/shell/platform/embedder/embedder.cc
+index a946208de4..328095e3e1 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder.cc
+@@ -3280,6 +3280,56 @@ FlutterEngineResult FlutterEngineMarkExternalTextureFrameAvailable(
+   return kSuccess;
+ }
+ 
++FlutterEngineResult FlutterEngineMarkExternalTextureFrameAvailableWithInfo(
++    FLUTTER_API_SYMBOL(FlutterEngine) engine,
++    int64_t texture_identifier,
++    const FlutterExternalTextureFrameInfo* frame_info) {
++  if (engine == nullptr) {
++    return LOG_EMBEDDER_ERROR(kInvalidArguments, "Invalid engine handle.");
++  }
++  if (texture_identifier == 0) {
++    return LOG_EMBEDDER_ERROR(kInvalidArguments, "Invalid texture identifier.");
++  }
++  if (frame_info == nullptr) {
++    return LOG_EMBEDDER_ERROR(kInvalidArguments, "Invalid frame info.");
++  }
++
++  // Without a size and damage, the whole frame is damaged.
++  std::optional<flutter::Texture::Damage> damage;
++  if (STRUCT_HAS_MEMBER(frame_info, size) &&
++      STRUCT_HAS_MEMBER(frame_info, damage)) {
++    const FlutterUIntSize& size = frame_info->size;
++    const FlutterDamage& frame_damage = frame_info->damage;
++    if (frame_damage.num_rects > 0 && frame_damage.damage == nullptr) {
++      return LOG_EMBEDDER_ERROR(kInvalidArguments,
++                                "Frame damage has rects but no rect array.");
++    }
++    if (size.width > 0 && size.height > 0) {
++      auto frame_bounds = flutter::DlIRect::MakeWH(
++          static_cast<int32_t>(size.width), static_cast<int32_t>(size.height));
++      flutter::DlIRect rect;
++      for (size_t i = 0; i < frame_damage.num_rects; i++) {
++        const FlutterRect& damage_rect = frame_damage.damage[i];
++        rect = rect.Union(flutter::DlIRect::RoundOut(
++            flutter::DlRect::MakeLTRB(damage_rect.left, damage_rect.top,
++                                      damage_rect.right, damage_rect.bottom)));
++      }
++      damage = flutter::Texture::Damage{
++          .frame_size = frame_bounds.GetSize(),
++          .rect = rect.IntersectionOrEmpty(frame_bounds),
++      };
++    }
++  }
++
++  if (!reinterpret_cast<flutter::EmbedderEngine*>(engine)
++           ->MarkTextureFrameAvailable(texture_identifier, damage)) {
++    return LOG_EMBEDDER_ERROR(
++        kInternalInconsistency,
++        "Could not mark the texture frame as being available.");
++  }
++  return kSuccess;
++}
++
+ FlutterEngineResult FlutterEngineUpdateSemanticsEnabled(
+     FLUTTER_API_SYMBOL(FlutterEngine) engine,
+     bool enabled) {
+@@ -3844,6 +3894,8 @@ FlutterEngineResult FlutterEngineGetProcAddresses(
+            FlutterEngineUpdateAccessibilityFeatures);
+   SET_PROC(DispatchSemanticsAction, FlutterEngineDispatchSemanticsAction);
+   SET_PROC(SendSemanticsAction, FlutterEngineSendSemanticsAction);
++  SET_PROC(MarkExternalTextureFrameAvailableWithInfo,
++           FlutterEngineMarkExternalTextureFrameAvailableWithInfo);
+   SET_PROC(OnVsync, FlutterEngineOnVsync);
+   SET_PROC(ReloadSystemFonts, FlutterEngineReloadSystemFonts);
+   SET_PROC(TraceEventDurationBegin, FlutterEngineTraceEventDurationBegin);
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder.h b/engine/src/flutter/shell/platform/embedder/embedder.h
+index 52271c0e3e..2fc2b2c79d 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder.h
+@@ -726,6 +726,22 @@ typedef struct {
+   FlutterDamage buffer_damage;
+ } FlutterPresentInfo;
+ 
++/// This information is passed to the engine when a new frame of an external
++/// texture is marked available.
++///
++/// See: \ref FlutterEngineMarkExternalTextureFrameAvailableWithInfo.
++typedef struct {
++  /// The size of this struct. Must be
++  /// sizeof(FlutterExternalTextureFrameInfo).
++  size_t struct_size;
++  /// The size of the new frame, in pixels.
++  FlutterUIntSize size;
++  /// Damage representing the area of the new frame that differs from the
++  /// previous frame of the texture, in pixels of the new frame. A frame whose
++  /// size differs from the previous frame's is damaged as a whole.
++  FlutterDamage damage;
++} FlutterExternalTextureFrameInfo;
++
+ /// Callback for when a surface is presented.
+ typedef bool (*BoolPresentInfoCallback)(
+     void* /* user data */,
+@@ -3334,6 +3350,32 @@ FlutterEngineResult FlutterEngineMarkExternalTextureFrameAvailable(
+     FLUTTER_API_SYMBOL(FlutterEngine) engine,
+     int64_t texture_identifier);
+ 
++//------------------------------------------------------------------------------
++/// @brief      Mark that a new texture frame is available for a given texture
++///             identifier, with the area of that frame that differs from the
++///             previous one.
++///
++///             Texture damage is needed for dirty region management of
++///             external textures: with it, only the damaged area of the
++///             texture is rendered again. A frame marked with
++///             `FlutterEngineMarkExternalTextureFrameAvailable` is damaged as
++///             a whole.
++///
++/// @see        FlutterEngineMarkExternalTextureFrameAvailable()
++///
++/// @param[in]  engine              A running engine instance.
++/// @param[in]  texture_identifier  The identifier of the texture whose frame
++///                                 has been updated.
++/// @param[in]  frame_info          The size and damage of the new frame.
++///
++/// @return     The result of the call.
++///
++FLUTTER_EXPORT
++FlutterEngineResult FlutterEngineMarkExternalTextureFrameAvailableWithInfo(
++    FLUTTER_API_SYMBOL(FlutterEngine) engine,
++    int64_t texture_identifier,
++    const FlutterExternalTextureFrameInfo* frame_info);
++
+ //------------------------------------------------------------------------------
+ /// @brief      Enable or disable accessibility semantics.
+ ///
+@@ -3777,6 +3819,11 @@ typedef FlutterEngineResult (
+     *FlutterEngineMarkExternalTextureFrameAvailableFnPtr)(
+     FLUTTER_API_SYMBOL(FlutterEngine) engine,
+     int64_t texture_identifier);
++typedef FlutterEngineResult (
++    *FlutterEngineMarkExternalTextureFrameAvailableWithInfoFnPtr)(
++    FLUTTER_API_SYMBOL(FlutterEngine) engine,
++    int64_t texture_identifier,
++    const FlutterExternalTextureFrameInfo* frame_info);
+ typedef FlutterEngineResult (*FlutterEngineUpdateSemanticsEnabledFnPtr)(
+     FLUTTER_API_SYMBOL(FlutterEngine) engine,
+     bool enabled);
+@@ -3895,6 +3942,8 @@ typedef struct {
+   FlutterEngineRemoveViewFnPtr RemoveView;
+   FlutterEngineSendViewFocusEventFnPtr SendViewFocusEvent;
+   FlutterEngineSendSemanticsActionFnPtr SendSemanticsAction;
++  FlutterEngineMarkExternalTextureFrameAvailableWithInfoFnPtr
++      MarkExternalTextureFrameAvailableWithInfo;
+ } FlutterEngineProcTable;
+ 
+ //------------------------------------------------------------------------------
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_engine.cc b/engine/src/flutter/shell/platform/embedder/embedder_engine.cc
+index d3e78ee553..9112cc50d5 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_engine.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_engine.cc
+@@ -189,6 +189,8 @@ bool EmbedderEngine::RegisterTexture(int64_t texture) {
+   if (!IsValid()) {
+     return false;
+   }
++  // Before the texture can be marked: from here on its frames are recorded.
++  external_texture_resolver_->frames()->Register(texture);
+   shell_->GetPlatformView()->RegisterTexture(
+       external_texture_resolver_->ResolveExternalTexture(texture));
+   return true;
+@@ -199,13 +201,19 @@ bool EmbedderEngine::UnregisterTexture(int64_t texture) {
+     return false;
+   }
+   shell_->GetPlatformView()->UnregisterTexture(texture);
++  external_texture_resolver_->frames()->Forget(texture);
+   return true;
+ }
+ 
+-bool EmbedderEngine::MarkTextureFrameAvailable(int64_t texture) {
++bool EmbedderEngine::MarkTextureFrameAvailable(
++    int64_t texture,
++    std::optional<Texture::Damage> damage) {
+   if (!IsValid()) {
+     return false;
+   }
++  // Every frame is recorded, damage or not: the texture takes one per
++  // |Texture::MarkNewFrameAvailable|.
++  external_texture_resolver_->frames()->MarkFrameAvailable(texture, damage);
+   shell_->GetPlatformView()->MarkTextureFrameAvailable(texture);
+   return true;
+ }
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_engine.h b/engine/src/flutter/shell/platform/embedder/embedder_engine.h
+index c9c16ecb9e..605e36620b 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_engine.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_engine.h
+@@ -6,6 +6,7 @@
+ #define FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_ENGINE_H_
+ 
+ #include <memory>
++#include <optional>
+ #include <unordered_map>
+ 
+ #include "flutter/fml/macros.h"
+@@ -62,7 +63,11 @@ class EmbedderEngine {
+ 
+   bool UnregisterTexture(int64_t texture);
+ 
+-  bool MarkTextureFrameAvailable(int64_t texture);
++  // |damage| is the part of the new frame that changed since the previous
++  // one, or std::nullopt when it is not known.
++  bool MarkTextureFrameAvailable(
++      int64_t texture,
++      std::optional<Texture::Damage> damage = std::nullopt);
+ 
+   bool SetSemanticsEnabled(bool enabled);
+ 
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.cc
+new file mode 100644
+index 0000000000..5c12ff837d
+--- /dev/null
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.cc
+@@ -0,0 +1,111 @@
++// Copyright 2013 The Flutter Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "flutter/shell/platform/embedder/embedder_external_texture_frames.h"
++
++#include <utility>
++
++namespace flutter {
++
++namespace {
++
++// Frames whose damage a texture keeps, to answer for layer trees painted that
++// many frames ago at most.
++constexpr size_t kMaxHistoryFrames = 8;
++
++}  // namespace
++
++EmbedderExternalTextureFrames::EmbedderExternalTextureFrames() = default;
++
++EmbedderExternalTextureFrames::~EmbedderExternalTextureFrames() = default;
++
++void EmbedderExternalTextureFrames::Register(int64_t texture_id) {
++  std::scoped_lock lock(mutex_);
++  pending_[texture_id] = Pending();
++}
++
++void EmbedderExternalTextureFrames::MarkFrameAvailable(
++    int64_t texture_id,
++    std::optional<Texture::Damage> damage) {
++  std::scoped_lock lock(mutex_);
++  auto found = pending_.find(texture_id);
++  if (found == pending_.end()) {
++    return;
++  }
++  auto& pending = found->second;
++  pending.frames.push_back(damage);
++  if (pending.frames.size() > kMaxPendingFrames) {
++    pending.frames.pop_front();
++    pending.dropped++;
++  }
++}
++
++std::optional<Texture::Damage> EmbedderExternalTextureFrames::TakeFrame(
++    int64_t texture_id) {
++  std::scoped_lock lock(mutex_);
++  auto found = pending_.find(texture_id);
++  if (found == pending_.end()) {
++    return std::nullopt;
++  }
++  auto& pending = found->second;
++  std::optional<Texture::Damage> damage;
++  if (pending.dropped > 0) {
++    pending.dropped--;
++  } else if (!pending.frames.empty()) {
++    damage = pending.frames.front();
++    pending.frames.pop_front();
++  }
++  return damage;
++}
++
++void EmbedderExternalTextureFrames::Forget(int64_t texture_id) {
++  std::scoped_lock lock(mutex_);
++  pending_.erase(texture_id);
++}
++
++EmbedderExternalTextureFrames::History::History()
++    : frame_id_(Texture::NextFrameId()), oldest_frame_id_(frame_id_) {}
++
++void EmbedderExternalTextureFrames::History::AddFrame(
++    std::optional<Texture::Damage> damage) {
++  frame_id_ = Texture::NextFrameId();
++  frames_.push_back({frame_id_, damage});
++  if (frames_.size() > kMaxHistoryFrames) {
++    oldest_frame_id_ = frames_.front().frame_id;
++    frames_.pop_front();
++  }
++}
++
++std::optional<Texture::Damage>
++EmbedderExternalTextureFrames::History::DamageSince(uint64_t frame_id) const {
++  if (frames_.empty()) {
++    return std::nullopt;
++  }
++  auto frame = frames_.begin();
++  if (frame_id != oldest_frame_id_) {
++    while (frame != frames_.end() && frame->frame_id != frame_id) {
++      ++frame;
++    }
++    if (frame == frames_.end()) {
++      return std::nullopt;
++    }
++    // The damage of the frames after it.
++    ++frame;
++  }
++  const auto& latest = frames_.back().damage;
++  if (!latest.has_value()) {
++    return std::nullopt;
++  }
++  Texture::Damage damage{.frame_size = latest->frame_size, .rect = {}};
++  for (; frame != frames_.end(); ++frame) {
++    if (!frame->damage.has_value() ||
++        frame->damage->frame_size != damage.frame_size) {
++      return std::nullopt;
++    }
++    damage.rect = damage.rect.Union(frame->damage->rect);
++  }
++  return damage;
++}
++
++}  // namespace flutter
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.h
+new file mode 100644
+index 0000000000..84a50b2c2d
+--- /dev/null
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_frames.h
+@@ -0,0 +1,132 @@
++// Copyright 2013 The Flutter Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_FRAMES_H_
++#define FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_FRAMES_H_
++
++#include <cstdint>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <optional>
++
++#include "flutter/common/graphics/texture.h"
++#include "flutter/fml/macros.h"
++
++namespace flutter {
++
++//------------------------------------------------------------------------------
++/// The frames the embedder marks available on its external textures, with
++/// their damage, from the platform thread where a frame is marked to the
++/// raster thread where the texture takes it.
++///
++/// Every frame marked available reaches the texture as exactly one
++/// |Texture::MarkNewFrameAvailable|, in the same order, so each call takes
++/// the damage of the oldest frame not taken yet.
++///
++class EmbedderExternalTextureFrames {
++ public:
++  EmbedderExternalTextureFrames();
++
++  ~EmbedderExternalTextureFrames();
++
++  //----------------------------------------------------------------------------
++  /// @brief      Starts recording the frames of texture |texture_id|.
++  ///
++  ///             Called on the platform thread, when the texture is
++  ///             registered.
++  ///
++  void Register(int64_t texture_id);
++
++  //----------------------------------------------------------------------------
++  /// @brief      Records a new frame of texture |texture_id|, with the part of
++  ///             it that changed since the previous frame, or std::nullopt
++  ///             when that is not known. Frames of a texture that is not
++  ///             registered are not recorded: no texture would take them.
++  ///
++  ///             Called on the platform thread.
++  ///
++  void MarkFrameAvailable(int64_t texture_id,
++                          std::optional<Texture::Damage> damage);
++
++  //----------------------------------------------------------------------------
++  /// @brief      Takes the damage of the oldest frame of texture |texture_id|
++  ///             not taken yet, or std::nullopt when it is not known.
++  ///
++  ///             Called on the raster thread.
++  ///
++  std::optional<Texture::Damage> TakeFrame(int64_t texture_id);
++
++  //----------------------------------------------------------------------------
++  /// @brief      Drops the frames of texture |texture_id| not taken yet, and
++  ///             stops recording its frames.
++  ///
++  ///             Called on the platform thread, when the texture is
++  ///             unregistered.
++  ///
++  void Forget(int64_t texture_id);
++
++  //----------------------------------------------------------------------------
++  /// The frames one texture presented, for |Texture::GetFrameId| and
++  /// |Texture::GetDamageSince|.
++  ///
++  /// Only used on the raster thread.
++  ///
++  class History {
++   public:
++    History();
++
++    //--------------------------------------------------------------------------
++    /// @brief      The frame the texture presents.
++    ///
++    uint64_t frame_id() const { return frame_id_; }
++
++    //--------------------------------------------------------------------------
++    /// @brief      Moves on to a new frame, with the part of it that changed
++    ///             since the previous one, or std::nullopt when that is not
++    ///             known.
++    ///
++    void AddFrame(std::optional<Texture::Damage> damage);
++
++    //--------------------------------------------------------------------------
++    /// @brief      The damage since the texture presented frame |frame_id|,
++    ///             or std::nullopt when that is not known: |frame_id| is too
++    ///             old, the damage of a frame since was not known, or the
++    ///             frame size changed.
++    ///
++    std::optional<Texture::Damage> DamageSince(uint64_t frame_id) const;
++
++   private:
++    struct Frame {
++      uint64_t frame_id;
++      // The damage since the frame before it.
++      std::optional<Texture::Damage> damage;
++    };
++
++    uint64_t frame_id_;
++    // The frame before the oldest of |frames_|.
++    uint64_t oldest_frame_id_;
++    std::deque<Frame> frames_;
++  };
++
++ private:
++  // Frames marked available beyond this many, and not taken yet, are only
++  // known to be damaged as a whole.
++  static constexpr size_t kMaxPendingFrames = 16;
++
++  struct Pending {
++    std::deque<std::optional<Texture::Damage>> frames;
++    // Frames dropped from the front of |frames|.
++    size_t dropped = 0;
++  };
++
++  std::mutex mutex_;
++  std::map<int64_t, Pending> pending_;
++
++  FML_DISALLOW_COPY_AND_ASSIGN(EmbedderExternalTextureFrames);
++};
++
++}  // namespace flutter
++
++#endif  // FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_FRAMES_H_
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc
+index 63a89dfa75..899e22c8be 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "flutter/shell/platform/embedder/embedder_external_texture_gl.h"
+ 
++#include <utility>
++
+ #include "flutter/display_list/image/dl_image_skia.h"
+ #include "flutter/fml/logging.h"
+ #include "impeller/core/texture_descriptor.h"
+@@ -30,8 +32,11 @@ namespace flutter {
+ 
+ EmbedderExternalTextureGL::EmbedderExternalTextureGL(
+     int64_t texture_identifier,
+-    const ExternalTextureCallback& callback)
+-    : Texture(texture_identifier), external_texture_callback_(callback) {
++    const ExternalTextureCallback& callback,
++    std::shared_ptr<EmbedderExternalTextureFrames> frames)
++    : Texture(texture_identifier),
++      external_texture_callback_(callback),
++      frames_(std::move(frames)) {
+   FML_DCHECK(external_texture_callback_);
+ }
+ 
+@@ -202,12 +207,18 @@ void EmbedderExternalTextureGL::OnGrContextDestroyed() {}
+ // |flutter::Texture|
+ void EmbedderExternalTextureGL::MarkNewFrameAvailable() {
+   last_image_ = nullptr;
+-  frame_id_ = NextFrameId();
++  history_.AddFrame(frames_ ? frames_->TakeFrame(Id()) : std::nullopt);
+ }
+ 
+ // |flutter::Texture|
+ std::optional<uint64_t> EmbedderExternalTextureGL::GetFrameId() const {
+-  return frame_id_;
++  return history_.frame_id();
++}
++
++// |flutter::Texture|
++std::optional<Texture::Damage> EmbedderExternalTextureGL::GetDamageSince(
++    uint64_t frame_id) const {
++  return history_.DamageSince(frame_id);
+ }
+ 
+ // |flutter::Texture|
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h
+index b46d4f5967..68dc7f5ed5 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h
+@@ -5,9 +5,12 @@
+ #ifndef FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_GL_H_
+ #define FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_GL_H_
+ 
++#include <memory>
++
+ #include "flutter/common/graphics/texture.h"
+ #include "flutter/fml/macros.h"
+ #include "flutter/shell/platform/embedder/embedder.h"
++#include "flutter/shell/platform/embedder/embedder_external_texture_frames.h"
+ #include "third_party/skia/include/core/SkSize.h"
+ 
+ namespace flutter {
+@@ -17,8 +20,10 @@ class EmbedderExternalTextureGL : public flutter::Texture {
+   using ExternalTextureCallback = std::function<
+       std::unique_ptr<FlutterOpenGLTexture>(int64_t, size_t, size_t)>;
+ 
+-  EmbedderExternalTextureGL(int64_t texture_identifier,
+-                            const ExternalTextureCallback& callback);
++  EmbedderExternalTextureGL(
++      int64_t texture_identifier,
++      const ExternalTextureCallback& callback,
++      std::shared_ptr<EmbedderExternalTextureFrames> frames = nullptr);
+ 
+   ~EmbedderExternalTextureGL();
+ 
+@@ -40,15 +45,20 @@ class EmbedderExternalTextureGL : public flutter::Texture {
+   // |flutter::Texture|
+   std::optional<uint64_t> GetFrameId() const override;
+ 
++  // |flutter::Texture|
++  std::optional<Damage> GetDamageSince(uint64_t frame_id) const override;
++
+   // |flutter::Texture|
+   void OnTextureUnregistered() override;
+ 
+  private:
+   const ExternalTextureCallback& external_texture_callback_;
+   sk_sp<DlImage> last_image_;
++  // The frames marked available on this texture, with their damage.
++  std::shared_ptr<EmbedderExternalTextureFrames> frames_;
+   // The frame |last_image_| is resolved from, kept until the next
+-  // |MarkNewFrameAvailable|.
+-  uint64_t frame_id_ = NextFrameId();
++  // |MarkNewFrameAvailable|, and the ones before it.
++  EmbedderExternalTextureFrames::History history_;
+ 
+   sk_sp<DlImage> ResolveTexture(int64_t texture_id,
+                                 GrDirectContext* context,
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h
+index 9532332274..98006bcd7b 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h
+@@ -5,9 +5,12 @@
+ #ifndef FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_METAL_H_
+ #define FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_METAL_H_
+ 
++#include <memory>
++
+ #include "flutter/common/graphics/texture.h"
+ #include "flutter/fml/macros.h"
+ #include "flutter/shell/platform/embedder/embedder.h"
++#include "flutter/shell/platform/embedder/embedder_external_texture_frames.h"
+ #include "impeller/display_list/aiks_context.h"
+ #include "third_party/skia/include/core/SkImage.h"
+ #include "third_party/skia/include/core/SkSize.h"
+@@ -19,8 +22,10 @@ class EmbedderExternalTextureMetal : public flutter::Texture {
+   using ExternalTextureCallback = std::function<
+       std::unique_ptr<FlutterMetalExternalTexture>(int64_t, size_t, size_t)>;
+ 
+-  EmbedderExternalTextureMetal(int64_t texture_identifier,
+-                               const ExternalTextureCallback& callback);
++  EmbedderExternalTextureMetal(
++      int64_t texture_identifier,
++      const ExternalTextureCallback& callback,
++      std::shared_ptr<EmbedderExternalTextureFrames> frames = nullptr);
+ 
+   ~EmbedderExternalTextureMetal();
+ 
+@@ -42,15 +47,20 @@ class EmbedderExternalTextureMetal : public flutter::Texture {
+   // |flutter::Texture|
+   std::optional<uint64_t> GetFrameId() const override;
+ 
++  // |flutter::Texture|
++  std::optional<Damage> GetDamageSince(uint64_t frame_id) const override;
++
+   // |flutter::Texture|
+   void OnTextureUnregistered() override;
+ 
+  private:
+   const ExternalTextureCallback& external_texture_callback_;
+   sk_sp<DlImage> last_image_;
++  // The frames marked available on this texture, with their damage.
++  std::shared_ptr<EmbedderExternalTextureFrames> frames_;
+   // The frame |last_image_| is resolved from, kept until the next
+-  // |MarkNewFrameAvailable|.
+-  uint64_t frame_id_ = NextFrameId();
++  // |MarkNewFrameAvailable|, and the ones before it.
++  EmbedderExternalTextureFrames::History history_;
+ 
+   sk_sp<DlImage> ResolveTexture(int64_t texture_id,
+                                 GrDirectContext* context,
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm
+index 3f762de268..85f205bcd5 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm
+@@ -4,6 +4,8 @@
+ 
+ #include "flutter/shell/platform/embedder/embedder_external_texture_metal.h"
+ 
++#include <utility>
++
+ #include "flow/layers/layer.h"
+ #include "flutter/display_list/image/dl_image_skia.h"
+ #include "flutter/fml/logging.h"
+@@ -24,9 +26,13 @@ static bool ValidNumTextures(int expected, int actual) {
+   }
+ }
+ 
+-EmbedderExternalTextureMetal::EmbedderExternalTextureMetal(int64_t texture_identifier,
+-                                                           const ExternalTextureCallback& callback)
+-    : Texture(texture_identifier), external_texture_callback_(callback) {
++EmbedderExternalTextureMetal::EmbedderExternalTextureMetal(
++    int64_t texture_identifier,
++    const ExternalTextureCallback& callback,
++    std::shared_ptr<EmbedderExternalTextureFrames> frames)
++    : Texture(texture_identifier),
++      external_texture_callback_(callback),
++      frames_(std::move(frames)) {
+   FML_DCHECK(external_texture_callback_);
+ }
+ 
+@@ -144,12 +150,18 @@ void EmbedderExternalTextureMetal::OnGrContextDestroyed() {}
+ // |flutter::Texture|
+ void EmbedderExternalTextureMetal::MarkNewFrameAvailable() {
+   last_image_ = nullptr;
+-  frame_id_ = NextFrameId();
++  history_.AddFrame(frames_ ? frames_->TakeFrame(Id()) : std::nullopt);
+ }
+ 
+ // |flutter::Texture|
+ std::optional<uint64_t> EmbedderExternalTextureMetal::GetFrameId() const {
+-  return frame_id_;
++  return history_.frame_id();
++}
++
++// |flutter::Texture|
++std::optional<Texture::Damage> EmbedderExternalTextureMetal::GetDamageSince(
++    uint64_t frame_id) const {
++  return history_.DamageSince(frame_id);
+ }
+ 
+ // |flutter::Texture|
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.cc
+index 2dcef86b20..7f8e376c4d 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.cc
+@@ -31,22 +31,22 @@ std::unique_ptr<Texture>
+ EmbedderExternalTextureResolver::ResolveExternalTexture(int64_t texture_id) {
+ #ifdef SHELL_ENABLE_GL
+   if (gl_callback_) {
+-    return std::make_unique<EmbedderExternalTextureGL>(texture_id,
+-                                                       gl_callback_);
++    return std::make_unique<EmbedderExternalTextureGL>(texture_id, gl_callback_,
++                                                       frames_);
+   }
+ #endif
+ 
+ #ifdef SHELL_ENABLE_METAL
+   if (metal_callback_) {
+-    return std::make_unique<EmbedderExternalTextureMetal>(texture_id,
+-                                                          metal_callback_);
++    return std::make_unique<EmbedderExternalTextureMetal>(
++        texture_id, metal_callback_, frames_);
+   }
+ #endif
+ 
+ #ifdef SHELL_ENABLE_VULKAN
+   if (vulkan_callback_) {
+-    return std::make_unique<EmbedderExternalTextureVulkan>(texture_id,
+-                                                           vulkan_callback_);
++    return std::make_unique<EmbedderExternalTextureVulkan>(
++        texture_id, vulkan_callback_, frames_);
+   }
+ #endif
+ 
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.h
+index 1079a006d6..bad55b2487 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_resolver.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ 
+ #include "flutter/common/graphics/texture.h"
++#include "flutter/shell/platform/embedder/embedder_external_texture_frames.h"
+ 
+ #ifdef SHELL_ENABLE_GL
+ #include "flutter/shell/platform/embedder/embedder_external_texture_gl.h"
+@@ -47,7 +48,15 @@ class EmbedderExternalTextureResolver {
+ 
+   bool SupportsExternalTextures();
+ 
++  // The frames marked available on the textures this resolver creates.
++  const std::shared_ptr<EmbedderExternalTextureFrames>& frames() const {
++    return frames_;
++  }
++
+  private:
++  std::shared_ptr<EmbedderExternalTextureFrames> frames_ =
++      std::make_shared<EmbedderExternalTextureFrames>();
++
+ #ifdef SHELL_ENABLE_GL
+   EmbedderExternalTextureGL::ExternalTextureCallback gl_callback_;
+ #endif
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc
+index dafe3fce1e..ec6e0dfc25 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "flutter/shell/platform/embedder/embedder_external_texture_vulkan.h"
+ 
++#include <utility>
++
+ #include "flutter/display_list/image/dl_image_skia.h"
+ #include "flutter/fml/logging.h"
+ #include "flutter/shell/platform/embedder/embedder_struct_macros.h"
+@@ -301,8 +303,11 @@ EmbedderExternalTextureSourceVulkan::GetYUVConversion() const {
+ 
+ EmbedderExternalTextureVulkan::EmbedderExternalTextureVulkan(
+     int64_t texture_identifier,
+-    const ExternalTextureCallback& callback)
+-    : Texture(texture_identifier), external_texture_callback_(callback) {
++    const ExternalTextureCallback& callback,
++    std::shared_ptr<EmbedderExternalTextureFrames> frames)
++    : Texture(texture_identifier),
++      external_texture_callback_(callback),
++      frames_(std::move(frames)) {
+   FML_DCHECK(external_texture_callback_);
+ }
+ 
+@@ -486,12 +491,18 @@ void EmbedderExternalTextureVulkan::OnGrContextDestroyed() {
+ // |flutter::Texture|
+ void EmbedderExternalTextureVulkan::MarkNewFrameAvailable() {
+   last_image_ = nullptr;
+-  frame_id_ = NextFrameId();
++  history_.AddFrame(frames_ ? frames_->TakeFrame(Id()) : std::nullopt);
+ }
+ 
+ // |flutter::Texture|
+ std::optional<uint64_t> EmbedderExternalTextureVulkan::GetFrameId() const {
+-  return frame_id_;
++  return history_.frame_id();
++}
++
++// |flutter::Texture|
++std::optional<Texture::Damage> EmbedderExternalTextureVulkan::GetDamageSince(
++    uint64_t frame_id) const {
++  return history_.DamageSince(frame_id);
+ }
+ 
+ // |flutter::Texture|
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h
+index 58fcba5b81..3ff4f56d1c 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h
+@@ -5,9 +5,12 @@
+ #ifndef FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_VULKAN_H_
+ #define FLUTTER_SHELL_PLATFORM_EMBEDDER_EMBEDDER_EXTERNAL_TEXTURE_VULKAN_H_
+ 
++#include <memory>
++
+ #include "flutter/common/graphics/texture.h"
+ #include "flutter/fml/macros.h"
+ #include "flutter/shell/platform/embedder/embedder.h"
++#include "flutter/shell/platform/embedder/embedder_external_texture_frames.h"
+ #if IMPELLER_SUPPORTS_RENDERING
+ #include "impeller/renderer/backend/vulkan/context_vk.h"         // nogncheck
+ #include "impeller/renderer/backend/vulkan/texture_source_vk.h"  // nogncheck
+@@ -77,8 +80,10 @@ class EmbedderExternalTextureVulkan : public flutter::Texture {
+  public:
+   using ExternalTextureCallback = std::function<
+       std::unique_ptr<FlutterVulkanExternalTexture>(int64_t, size_t, size_t)>;
+-  EmbedderExternalTextureVulkan(int64_t texture_identifier,
+-                                const ExternalTextureCallback& callback);
++  EmbedderExternalTextureVulkan(
++      int64_t texture_identifier,
++      const ExternalTextureCallback& callback,
++      std::shared_ptr<EmbedderExternalTextureFrames> frames = nullptr);
+ 
+   ~EmbedderExternalTextureVulkan();
+ 
+@@ -90,9 +95,11 @@ class EmbedderExternalTextureVulkan : public flutter::Texture {
+   const ExternalTextureCallback& external_texture_callback_;
+ 
+   sk_sp<DlImage> last_image_;
++  // The frames marked available on this texture, with their damage.
++  std::shared_ptr<EmbedderExternalTextureFrames> frames_;
+   // The frame |last_image_| is resolved from, kept until the next
+-  // |MarkNewFrameAvailable|.
+-  uint64_t frame_id_ = NextFrameId();
++  // |MarkNewFrameAvailable|, and the ones before it.
++  EmbedderExternalTextureFrames::History history_;
+ 
+   sk_sp<DlImage> ResolveTexture(int64_t texture_id,
+                                 GrDirectContext* context,
+@@ -125,6 +132,9 @@ class EmbedderExternalTextureVulkan : public flutter::Texture {
+   // |flutter::Texture|
+   std::optional<uint64_t> GetFrameId() const override;
+ 
++  // |flutter::Texture|
++  std::optional<Damage> GetDamageSince(uint64_t frame_id) const override;
++
+   // |flutter::Texture|
+   void OnTextureUnregistered() override;
+ 
+diff --git a/engine/src/flutter/shell/platform/embedder/tests/embedder_external_texture_frames_unittests.cc b/engine/src/flutter/shell/platform/embedder/tests/embedder_external_texture_frames_unittests.cc
+new file mode 100644
+index 0000000000..a354f44b7b
+--- /dev/null
++++ b/engine/src/flutter/shell/platform/embedder/tests/embedder_external_texture_frames_unittests.cc
+@@ -0,0 +1,146 @@
++// Copyright 2013 The Flutter Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "flutter/shell/platform/embedder/embedder_external_texture_frames.h"
++
++#include "gtest/gtest.h"
++
++namespace flutter {
++namespace testing {
++
++namespace {
++
++Texture::Damage MakeDamage(const DlIRect& rect) {
++  return Texture::Damage{.frame_size = DlISize(100, 100), .rect = rect};
++}
++
++}  // namespace
++
++TEST(EmbedderExternalTextureFramesTest, FramesAreTakenInOrder) {
++  EmbedderExternalTextureFrames frames;
++  frames.Register(1);
++  frames.Register(2);
++  frames.MarkFrameAvailable(1, MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  frames.MarkFrameAvailable(1, std::nullopt);
++  frames.MarkFrameAvailable(1, MakeDamage(DlIRect::MakeLTRB(5, 5, 10, 10)));
++
++  auto damage = frames.TakeFrame(1);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(0, 0, 10, 10));
++  EXPECT_FALSE(frames.TakeFrame(1).has_value());
++  damage = frames.TakeFrame(1);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(5, 5, 10, 10));
++  // Nothing left: not known.
++  EXPECT_FALSE(frames.TakeFrame(1).has_value());
++}
++
++TEST(EmbedderExternalTextureFramesTest, FramesArePerTexture) {
++  EmbedderExternalTextureFrames frames;
++  frames.Register(1);
++  frames.Register(2);
++  frames.MarkFrameAvailable(1, MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  frames.MarkFrameAvailable(2, MakeDamage(DlIRect::MakeLTRB(0, 0, 20, 20)));
++
++  auto damage = frames.TakeFrame(2);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(0, 0, 20, 20));
++  damage = frames.TakeFrame(1);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(0, 0, 10, 10));
++}
++
++TEST(EmbedderExternalTextureFramesTest, DroppedFramesAreNotKnown) {
++  EmbedderExternalTextureFrames frames;
++  frames.Register(1);
++  frames.Register(2);
++  for (int i = 0; i < 20; i++) {
++    frames.MarkFrameAvailable(1, MakeDamage(DlIRect::MakeLTRB(i, 0, i + 1, 1)));
++  }
++  // The four oldest were dropped, but still pair with their marks.
++  for (int i = 0; i < 4; i++) {
++    EXPECT_FALSE(frames.TakeFrame(1).has_value());
++  }
++  auto damage = frames.TakeFrame(1);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(4, 0, 5, 1));
++}
++
++TEST(EmbedderExternalTextureFramesTest, ForgottenFramesAreNotKnown) {
++  EmbedderExternalTextureFrames frames;
++  frames.Register(1);
++  frames.Register(2);
++  frames.MarkFrameAvailable(1, MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  frames.Forget(1);
++  EXPECT_FALSE(frames.TakeFrame(1).has_value());
++}
++
++TEST(EmbedderExternalTextureFramesTest, UnregisteredFramesAreNotRecorded) {
++  EmbedderExternalTextureFrames frames;
++  frames.MarkFrameAvailable(3, MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  frames.Register(3);
++  EXPECT_FALSE(frames.TakeFrame(3).has_value());
++}
++
++TEST(EmbedderExternalTextureFramesTest, HistoryUnitesTheDamageSinceAFrame) {
++  EmbedderExternalTextureFrames::History history;
++  auto first = history.frame_id();
++  history.AddFrame(MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  auto second = history.frame_id();
++  EXPECT_NE(first, second);
++  history.AddFrame(MakeDamage(DlIRect::MakeLTRB(20, 20, 30, 30)));
++
++  auto damage = history.DamageSince(first);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->frame_size, DlISize(100, 100));
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(0, 0, 30, 30));
++
++  damage = history.DamageSince(second);
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_EQ(damage->rect, DlIRect::MakeLTRB(20, 20, 30, 30));
++
++  damage = history.DamageSince(history.frame_id());
++  ASSERT_TRUE(damage.has_value());
++  EXPECT_TRUE(damage->rect.IsEmpty());
++}
++
++TEST(EmbedderExternalTextureFramesTest, HistoryDoesNotKnowOtherFrames) {
++  EmbedderExternalTextureFrames::History history;
++  EmbedderExternalTextureFrames::History other;
++  history.AddFrame(MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  EXPECT_FALSE(history.DamageSince(other.frame_id()).has_value());
++}
++
++TEST(EmbedderExternalTextureFramesTest, HistoryForgetsOldFrames) {
++  EmbedderExternalTextureFrames::History history;
++  auto first = history.frame_id();
++  for (int i = 0; i < 9; i++) {
++    history.AddFrame(MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  }
++  EXPECT_FALSE(history.DamageSince(first).has_value());
++}
++
++TEST(EmbedderExternalTextureFramesTest, HistoryDoesNotKnowAcrossUnknownDamage) {
++  EmbedderExternalTextureFrames::History history;
++  auto first = history.frame_id();
++  history.AddFrame(std::nullopt);
++  auto second = history.frame_id();
++  history.AddFrame(MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++
++  EXPECT_FALSE(history.DamageSince(first).has_value());
++  EXPECT_TRUE(history.DamageSince(second).has_value());
++}
++
++TEST(EmbedderExternalTextureFramesTest, HistoryDoesNotKnowAcrossResize) {
++  EmbedderExternalTextureFrames::History history;
++  auto first = history.frame_id();
++  history.AddFrame(MakeDamage(DlIRect::MakeLTRB(0, 0, 10, 10)));
++  history.AddFrame(Texture::Damage{.frame_size = DlISize(200, 100),
++                                   .rect = DlIRect::MakeLTRB(0, 0, 10, 10)});
++
++  EXPECT_FALSE(history.DamageSince(first).has_value());
++}
++
++}  // namespace testing
++}  // namespace flutter
+-- 
+2.55.0
+

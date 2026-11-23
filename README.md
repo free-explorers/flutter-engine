@@ -12,6 +12,11 @@ with the engine patches of [`patches/`](patches) applied in order:
 
 - `0002-embedder-partial-repaint-with-a-compositor.patch`: partial repaint for
   embedders that composite with `FlutterCompositor`.
+- `0003-flow-do-not-damage-texture-layers-whose-texture-has-no-new-frame.patch`:
+  a texture layer whose texture has no new frame is not repainted.
+- `0004-embedder-damage-only-what-changed-in-an-external-texture-frame.patch`:
+  `FlutterEngineMarkExternalTextureFrameAvailableWithInfo`, so that only the
+  damaged part of an external texture's new frame is repainted.
 
 They are the single source of Veshell's engine changes: the Nix build
 ([free-explorers/flutter-engine-nix](https://github.com/free-explorers/flutter-engine-nix))

@@ -1,0 +1,683 @@
+From b8644bde324e25404b3b5d8a6275e44a28717736 Mon Sep 17 00:00:00 2001
+From: PapyElGringo <adrien@pesler.be>
+Date: Mon, 23 Nov 2026 12:06:11 +0100
+Subject: [PATCH] [flow] Do not damage texture layers whose texture has no new
+ frame
+
+TextureLayer::Diff marked its whole area dirty on every frame, since the
+engine could not tell whether a texture had changed (TODO(knopp)). Any
+frame, even one that only blinks a text cursor, repainted every texture
+on screen, along with whatever is composited over or filters them: a blur
+over a texture re-ran over the whole blurred area.
+
+A texture can now identify the frame it presents (Texture::GetFrameId).
+The embedder's GL, Metal and Vulkan textures do: they keep presenting
+the same image until MarkNewFrameAvailable. Textures that may change on
+any paint (Android's) keep the default, std::nullopt, and are damaged on
+every frame as before.
+
+The diff records the frame each texture layer painted in the layer tree,
+next to its paint regions (a retained layer instance belongs to several
+trees, so it cannot be stored in the layer), and a texture layer that
+paints the same texture frame at the same place adds no damage.
+Frame identifiers are unique across textures, so a texture registered
+again under the same id is damaged.
+---
+ engine/src/flutter/common/graphics/texture.cc |   8 ++
+ engine/src/flutter/common/graphics/texture.h  |  21 ++++
+ engine/src/flutter/flow/compositor_context.cc |  19 ++--
+ engine/src/flutter/flow/compositor_context.h  |  12 ++-
+ engine/src/flutter/flow/diff_context.cc       |  49 ++++++++-
+ engine/src/flutter/flow/diff_context.h        |  39 ++++++-
+ engine/src/flutter/flow/layers/layer_tree.h   |   6 ++
+ .../src/flutter/flow/layers/texture_layer.cc  |  12 ++-
+ .../flow/layers/texture_layer_unittests.cc    | 102 ++++++++++++++++++
+ .../flutter/flow/testing/diff_context_test.cc |   3 +-
+ .../flutter/flow/testing/diff_context_test.h  |   6 ++
+ .../src/flutter/flow/testing/mock_texture.h   |  12 ++-
+ .../embedder/embedder_external_texture_gl.cc  |   6 ++
+ .../embedder/embedder_external_texture_gl.h   |   6 ++
+ .../embedder_external_texture_metal.h         |   6 ++
+ .../embedder_external_texture_metal.mm        |   6 ++
+ .../embedder_external_texture_vulkan.cc       |   6 ++
+ .../embedder_external_texture_vulkan.h        |   6 ++
+ 18 files changed, 303 insertions(+), 22 deletions(-)
+
+diff --git a/engine/src/flutter/common/graphics/texture.cc b/engine/src/flutter/common/graphics/texture.cc
+index 74d76c909f..2b3d67676a 100644
+--- a/engine/src/flutter/common/graphics/texture.cc
++++ b/engine/src/flutter/common/graphics/texture.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "flutter/common/graphics/texture.h"
+ 
++#include <atomic>
++
+ namespace flutter {
+ 
+ ContextListener::ContextListener() = default;
+@@ -14,6 +16,12 @@ Texture::Texture(int64_t id) : id_(id) {}
+ 
+ Texture::~Texture() = default;
+ 
++uint64_t Texture::NextFrameId() {
++  // Textures are created on the UI or the raster thread.
++  static std::atomic<uint64_t> next_frame_id{1};
++  return next_frame_id.fetch_add(1, std::memory_order_relaxed);
++}
++
+ TextureRegistry::TextureRegistry() = default;
+ 
+ void TextureRegistry::RegisterTexture(const std::shared_ptr<Texture>& texture) {
+diff --git a/engine/src/flutter/common/graphics/texture.h b/engine/src/flutter/common/graphics/texture.h
+index f5b7c0ab36..6d8dd3abf4 100644
+--- a/engine/src/flutter/common/graphics/texture.h
++++ b/engine/src/flutter/common/graphics/texture.h
+@@ -5,7 +5,9 @@
+ #ifndef FLUTTER_COMMON_GRAPHICS_TEXTURE_H_
+ #define FLUTTER_COMMON_GRAPHICS_TEXTURE_H_
+ 
++#include <cstdint>
+ #include <map>
++#include <optional>
+ 
+ #include "flutter/display_list/dl_canvas.h"
+ #include "flutter/fml/macros.h"
+@@ -58,8 +60,27 @@ class Texture : public ContextListener {
+   // Called on raster thread.
+   virtual void OnTextureUnregistered() = 0;
+ 
++  // Identifies the frame the texture presents, for a texture that keeps
++  // presenting the same frame until |MarkNewFrameAvailable| is called. Two
++  // equal identifiers mean the same content: a texture layer showing it is
++  // then left out of the frame damage. Identifiers are never shared between
++  // textures, so a texture registered again under the same id does not look
++  // unchanged.
++  //
++  // Returns std::nullopt, the default, for a texture that may present a new
++  // frame on any paint: the whole area of its layers is damaged on every
++  // frame.
++  //
++  // Called on raster thread.
++  virtual std::optional<uint64_t> GetFrameId() const { return std::nullopt; }
++
+   int64_t Id() { return id_; }
+ 
++ protected:
++  // Returns a frame identifier that no texture has used yet, for textures
++  // implementing |GetFrameId|.
++  static uint64_t NextFrameId();
++
+  private:
+   int64_t id_;
+   FML_DISALLOW_COPY_AND_ASSIGN(Texture);
+diff --git a/engine/src/flutter/flow/compositor_context.cc b/engine/src/flutter/flow/compositor_context.cc
+index 5d00fa1b7a..812053066b 100644
+--- a/engine/src/flutter/flow/compositor_context.cc
++++ b/engine/src/flutter/flow/compositor_context.cc
+@@ -13,13 +13,17 @@ namespace flutter {
+ std::optional<DlRect> FrameDamage::ComputeClipRect(
+     flutter::LayerTree& layer_tree,
+     bool has_raster_cache,
+-    bool impeller_enabled) {
++    bool impeller_enabled,
++    TextureRegistry* texture_registry) {
+   if (layer_tree.root_layer()) {
+     PaintRegionMap empty_paint_region_map;
+-    DiffContext context(layer_tree.frame_size(), layer_tree.paint_region_map(),
+-                        prev_layer_tree_ ? prev_layer_tree_->paint_region_map()
+-                                         : empty_paint_region_map,
+-                        has_raster_cache, impeller_enabled);
++    DiffContext context(
++        layer_tree.frame_size(), layer_tree.paint_region_map(),
++        prev_layer_tree_ ? prev_layer_tree_->paint_region_map()
++                         : empty_paint_region_map,
++        has_raster_cache, impeller_enabled, &layer_tree.texture_frame_map(),
++        prev_layer_tree_ ? &prev_layer_tree_->texture_frame_map() : nullptr,
++        texture_registry);
+     context.PushCullRect(DlRect::MakeSize(layer_tree.frame_size()));
+     {
+       DiffContext::AutoSubtreeRestore subtree(&context);
+@@ -119,8 +123,9 @@ RasterStatus CompositorContext::ScopedFrame::Raster(
+ 
+   std::optional<DlRect> clip_rect;
+   if (frame_damage) {
+-    clip_rect = frame_damage->ComputeClipRect(layer_tree, !ignore_raster_cache,
+-                                              !gr_context_);
++    clip_rect = frame_damage->ComputeClipRect(
++        layer_tree, !ignore_raster_cache, !gr_context_,
++        context_.texture_registry().get());
+ 
+     if (aiks_context_ &&
+         !ShouldPerformPartialRepaint(clip_rect, layer_tree.frame_size())) {
+diff --git a/engine/src/flutter/flow/compositor_context.h b/engine/src/flutter/flow/compositor_context.h
+index b21e8fd9b3..7f4725ba05 100644
+--- a/engine/src/flutter/flow/compositor_context.h
++++ b/engine/src/flutter/flow/compositor_context.h
+@@ -71,9 +71,15 @@ class FrameDamage {
+   // If previous layer tree is not specified, clip rect will be nullopt,
+   // but the paint region of layer_tree will be calculated so that it can be
+   // used for diffing of subsequent frames.
+-  std::optional<DlRect> ComputeClipRect(flutter::LayerTree& layer_tree,
+-                                        bool has_raster_cache,
+-                                        bool impeller_enabled);
++  //
++  // When |texture_registry| is given, texture layers whose texture still
++  // presents the frame painted in previous layer tree are not damaged (see
++  // Texture::GetFrameId).
++  std::optional<DlRect> ComputeClipRect(
++      flutter::LayerTree& layer_tree,
++      bool has_raster_cache,
++      bool impeller_enabled,
++      TextureRegistry* texture_registry = nullptr);
+ 
+   // See Damage::frame_damage.
+   std::optional<DlIRect> GetFrameDamage() const {
+diff --git a/engine/src/flutter/flow/diff_context.cc b/engine/src/flutter/flow/diff_context.cc
+index 84d084b9e0..278a9e1922 100644
+--- a/engine/src/flutter/flow/diff_context.cc
++++ b/engine/src/flutter/flow/diff_context.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "flutter/flow/diff_context.h"
+ 
++#include "flutter/common/graphics/texture.h"
+ #include "flutter/flow/layers/layer.h"
+ #include "flutter/flow/raster_cache_util.h"
+ 
+@@ -13,13 +14,19 @@ DiffContext::DiffContext(DlISize frame_size,
+                          PaintRegionMap& this_frame_paint_region_map,
+                          const PaintRegionMap& last_frame_paint_region_map,
+                          bool has_raster_cache,
+-                         bool impeller_enabled)
++                         bool impeller_enabled,
++                         TextureFrameMap* this_frame_texture_frame_map,
++                         const TextureFrameMap* last_frame_texture_frame_map,
++                         TextureRegistry* texture_registry)
+     : rects_(std::make_shared<std::vector<DlRect>>()),
+       frame_size_(frame_size),
+       this_frame_paint_region_map_(this_frame_paint_region_map),
+       last_frame_paint_region_map_(last_frame_paint_region_map),
+       has_raster_cache_(has_raster_cache),
+-      impeller_enabled_(impeller_enabled) {}
++      impeller_enabled_(impeller_enabled),
++      this_frame_texture_frame_map_(this_frame_texture_frame_map),
++      last_frame_texture_frame_map_(last_frame_texture_frame_map),
++      texture_registry_(texture_registry) {}
+ 
+ void DiffContext::BeginSubtree() {
+   state_stack_.push_back(state_);
+@@ -254,6 +261,44 @@ PaintRegion DiffContext::GetOldLayerPaintRegion(const Layer* layer) const {
+   }
+ }
+ 
++std::optional<uint64_t> DiffContext::GetTextureFrameId(
++    int64_t texture_id) const {
++  if (!texture_registry_) {
++    return std::nullopt;
++  }
++  auto texture = texture_registry_->GetTexture(texture_id);
++  if (!texture) {
++    return std::nullopt;
++  }
++  return texture->GetFrameId();
++}
++
++void DiffContext::SetLayerTextureFrame(const Layer* layer, int64_t texture_id) {
++  if (!this_frame_texture_frame_map_) {
++    return;
++  }
++  auto frame_id = GetTextureFrameId(texture_id);
++  if (frame_id.has_value()) {
++    (*this_frame_texture_frame_map_)[layer->unique_id()] = frame_id.value();
++  }
++}
++
++bool DiffContext::IsOldLayerTextureFrameCurrent(const Layer* layer,
++                                                int64_t texture_id) const {
++  if (!last_frame_texture_frame_map_) {
++    return false;
++  }
++  auto frame_id = GetTextureFrameId(texture_id);
++  if (!frame_id.has_value()) {
++    return false;
++  }
++  auto i = last_frame_texture_frame_map_->find(layer->unique_id());
++  // Frame identifiers are unique across textures: an old layer that painted
++  // another texture never matches.
++  return i != last_frame_texture_frame_map_->end() &&
++         i->second == frame_id.value();
++}
++
+ void DiffContext::Statistics::LogStatistics() {
+ #if !FLUTTER_RELEASE
+   FML_TRACE_COUNTER("flutter", "DiffContext", reinterpret_cast<int64_t>(this),
+diff --git a/engine/src/flutter/flow/diff_context.h b/engine/src/flutter/flow/diff_context.h
+index d51778186e..1645dec098 100644
+--- a/engine/src/flutter/flow/diff_context.h
++++ b/engine/src/flutter/flow/diff_context.h
+@@ -16,6 +16,7 @@
+ namespace flutter {
+ 
+ class Layer;
++class TextureRegistry;
+ 
+ // Represents area that needs to be updated in front buffer (frame_damage) and
+ // area that is going to be painted to in back buffer (buffer_damage).
+@@ -37,14 +38,22 @@ struct Damage {
+ // Layer Unique Id to PaintRegion
+ using PaintRegionMap = std::map<uint64_t, PaintRegion>;
+ 
++// Layer Unique Id to the frame of the texture it paints (see
++// Texture::GetFrameId)
++using TextureFrameMap = std::map<uint64_t, uint64_t>;
++
+ // Tracks state during tree diffing process and computes resulting damage
+ class DiffContext {
+  public:
+-  explicit DiffContext(DlISize frame_size,
+-                       PaintRegionMap& this_frame_paint_region_map,
+-                       const PaintRegionMap& last_frame_paint_region_map,
+-                       bool has_raster_cache,
+-                       bool impeller_enabled);
++  explicit DiffContext(
++      DlISize frame_size,
++      PaintRegionMap& this_frame_paint_region_map,
++      const PaintRegionMap& last_frame_paint_region_map,
++      bool has_raster_cache,
++      bool impeller_enabled,
++      TextureFrameMap* this_frame_texture_frame_map = nullptr,
++      const TextureFrameMap* last_frame_texture_frame_map = nullptr,
++      TextureRegistry* texture_registry = nullptr);
+ 
+   // Starts a new subtree.
+   void BeginSubtree();
+@@ -157,6 +166,20 @@ class DiffContext {
+   // frame layer tree.
+   PaintRegion GetOldLayerPaintRegion(const Layer* layer) const;
+ 
++  // Associates the current frame of texture |texture_id| with specified layer
++  // and current layer tree, when the texture identifies its frames (see
++  // Texture::GetFrameId). Like the paint region, it can not be stored in the
++  // layer itself, because the same retained layer instance is part of
++  // several layer trees.
++  void SetLayerTextureFrame(const Layer* layer, int64_t texture_id);
++
++  // Whether texture |texture_id| still presents the frame associated with
++  // specified layer and previous frame layer tree. False when that is not
++  // known: no frame was associated, or the texture does not identify its
++  // frames.
++  bool IsOldLayerTextureFrameCurrent(const Layer* layer,
++                                     int64_t texture_id) const;
++
+   // Whether or not a raster cache is being used. If so, we must snap
+   // all transformations to physical pixels if the layer may be raster
+   // cached.
+@@ -248,6 +271,12 @@ class DiffContext {
+   const PaintRegionMap& last_frame_paint_region_map_;
+   bool has_raster_cache_;
+   bool impeller_enabled_;
++  TextureFrameMap* this_frame_texture_frame_map_;
++  const TextureFrameMap* last_frame_texture_frame_map_;
++  TextureRegistry* texture_registry_;
++
++  // The frame texture |texture_id| presents, if it identifies its frames.
++  std::optional<uint64_t> GetTextureFrameId(int64_t texture_id) const;
+ 
+   void AddDamage(const DlRect& rect);
+ 
+diff --git a/engine/src/flutter/flow/layers/layer_tree.h b/engine/src/flutter/flow/layers/layer_tree.h
+index 193e0c0af4..1cd3146a8a 100644
+--- a/engine/src/flutter/flow/layers/layer_tree.h
++++ b/engine/src/flutter/flow/layers/layer_tree.h
+@@ -57,11 +57,17 @@ class LayerTree {
+   const PaintRegionMap& paint_region_map() const { return paint_region_map_; }
+   PaintRegionMap& paint_region_map() { return paint_region_map_; }
+ 
++  const TextureFrameMap& texture_frame_map() const {
++    return texture_frame_map_;
++  }
++  TextureFrameMap& texture_frame_map() { return texture_frame_map_; }
++
+  private:
+   std::shared_ptr<Layer> root_layer_;
+   DlISize frame_size_;  // Physical pixels.
+ 
+   PaintRegionMap paint_region_map_;
++  TextureFrameMap texture_frame_map_;
+ 
+   std::vector<RasterCacheItem*> raster_cache_items_;
+ 
+diff --git a/engine/src/flutter/flow/layers/texture_layer.cc b/engine/src/flutter/flow/layers/texture_layer.cc
+index edad3a9e58..1d5ee79a96 100644
+--- a/engine/src/flutter/flow/layers/texture_layer.cc
++++ b/engine/src/flutter/flow/layers/texture_layer.cc
+@@ -24,9 +24,14 @@ void TextureLayer::Diff(DiffContext* context, const Layer* old_layer) {
+   if (!context->IsSubtreeDirty()) {
+     FML_DCHECK(old_layer);
+     auto prev = old_layer->as_texture_layer();
+-    // TODO(knopp) It would be nice to be able to determine that a texture is
+-    // dirty
+-    context->MarkSubtreeDirty(context->GetOldLayerPaintRegion(prev));
++    // A texture that identifies its frames is only repainted when it presents
++    // a new one; any other texture may change on every paint.
++    if (prev->offset_ != offset_ || prev->size_ != size_ ||
++        prev->texture_id_ != texture_id_ || prev->freeze_ != freeze_ ||
++        prev->sampling_ != sampling_ ||
++        !context->IsOldLayerTextureFrameCurrent(prev, texture_id_)) {
++      context->MarkSubtreeDirty(context->GetOldLayerPaintRegion(prev));
++    }
+   }
+ 
+   // Make sure DiffContext knows there is a TextureLayer in this subtree.
+@@ -37,6 +42,7 @@ void TextureLayer::Diff(DiffContext* context, const Layer* old_layer) {
+   context->MarkSubtreeHasTextureLayer();
+   context->AddLayerBounds(DlRect::MakeOriginSize(offset_, size_));
+   context->SetLayerPaintRegion(this, context->CurrentSubtreeRegion());
++  context->SetLayerTextureFrame(this, texture_id_);
+ }
+ 
+ void TextureLayer::Preroll(PrerollContext* context) {
+diff --git a/engine/src/flutter/flow/layers/texture_layer_unittests.cc b/engine/src/flutter/flow/layers/texture_layer_unittests.cc
+index 7148559ace..31499dfbf7 100644
+--- a/engine/src/flutter/flow/layers/texture_layer_unittests.cc
++++ b/engine/src/flutter/flow/layers/texture_layer_unittests.cc
+@@ -114,6 +114,108 @@ TEST_F(TextureLayerDiffTest, TextureInRetainedLayer) {
+   EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
+ }
+ 
++static std::shared_ptr<TextureLayer> MakeTextureLayer(
++    int64_t texture_id,
++    const DlPoint& offset = DlPoint()) {
++  return std::make_shared<TextureLayer>(offset, DlSize(100, 100), texture_id,
++                                        false, DlImageSampling::kLinear);
++}
++
++TEST_F(TextureLayerDiffTest, TextureWithoutFrameIdsIsAlwaysDamaged) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  tree1.root()->Add(MakeTextureLayer(0));
++  DiffLayerTree(tree1, MockLayerTree());
++
++  MockLayerTree tree2;
++  tree2.root()->Add(MakeTextureLayer(0));
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++}
++
++TEST_F(TextureLayerDiffTest, TextureWithoutNewFrameIsNotDamaged) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  tree1.root()->Add(MakeTextureLayer(0));
++  auto damage = DiffLayerTree(tree1, MockLayerTree());
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++
++  MockLayerTree tree2;
++  tree2.root()->Add(MakeTextureLayer(0));
++  damage = DiffLayerTree(tree2, tree1);
++  EXPECT_TRUE(damage.frame_damage.IsEmpty());
++
++  texture->MarkNewFrameAvailable();
++  MockLayerTree tree3;
++  tree3.root()->Add(MakeTextureLayer(0));
++  damage = DiffLayerTree(tree3, tree2);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++}
++
++TEST_F(TextureLayerDiffTest, RetainedTextureWithoutNewFrameIsNotDamaged) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  auto container = std::make_shared<ContainerLayer>();
++  tree1.root()->Add(container);
++  container->Add(MakeTextureLayer(0));
++  DiffLayerTree(tree1, MockLayerTree());
++
++  MockLayerTree tree2;
++  tree2.root()->Add(container);  // retained layer
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_TRUE(damage.frame_damage.IsEmpty());
++
++  texture->MarkNewFrameAvailable();
++  MockLayerTree tree3;
++  tree3.root()->Add(container);  // retained layer
++  damage = DiffLayerTree(tree3, tree2);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++}
++
++TEST_F(TextureLayerDiffTest, MovedTextureIsDamaged) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  tree1.root()->Add(MakeTextureLayer(0));
++  DiffLayerTree(tree1, MockLayerTree());
++
++  MockLayerTree tree2;
++  tree2.root()->Add(MakeTextureLayer(0, DlPoint(50, 0)));
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 150, 100));
++}
++
++TEST_F(TextureLayerDiffTest, ReplacedTextureIsDamaged) {
++  auto texture = std::make_shared<MockTexture>(0);
++  texture->IdentifyFrames();
++  texture_registry()->RegisterTexture(texture);
++
++  MockLayerTree tree1;
++  tree1.root()->Add(MakeTextureLayer(0));
++  DiffLayerTree(tree1, MockLayerTree());
++
++  // Another texture registered under the same id.
++  texture_registry()->UnregisterTexture(0);
++  auto replacement = std::make_shared<MockTexture>(0);
++  replacement->IdentifyFrames();
++  texture_registry()->RegisterTexture(replacement);
++
++  MockLayerTree tree2;
++  tree2.root()->Add(MakeTextureLayer(0));
++  auto damage = DiffLayerTree(tree2, tree1);
++  EXPECT_EQ(damage.frame_damage, DlIRect::MakeLTRB(0, 0, 100, 100));
++}
++
+ TEST_F(TextureLayerTest, OpacityInheritance) {
+   const DlPoint layer_offset = DlPoint();
+   const DlSize layer_size = DlSize(8.0f, 8.0f);
+diff --git a/engine/src/flutter/flow/testing/diff_context_test.cc b/engine/src/flutter/flow/testing/diff_context_test.cc
+index 5298c910a6..004a0fd1ee 100644
+--- a/engine/src/flutter/flow/testing/diff_context_test.cc
++++ b/engine/src/flutter/flow/testing/diff_context_test.cc
+@@ -23,7 +23,8 @@ Damage DiffContextTest::DiffLayerTree(MockLayerTree& layer_tree,
+ 
+   DiffContext dc(layer_tree.size(), layer_tree.paint_region_map(),
+                  old_layer_tree.paint_region_map(), use_raster_cache,
+-                 impeller_enabled);
++                 impeller_enabled, &layer_tree.texture_frame_map(),
++                 &old_layer_tree.texture_frame_map(), texture_registry().get());
+   dc.PushCullRect(DlRect::MakeSize(layer_tree.size()));
+   layer_tree.root()->Diff(&dc, old_layer_tree.root());
+   return dc.ComputeDamage(additional_damage, horizontal_clip_alignment,
+diff --git a/engine/src/flutter/flow/testing/diff_context_test.h b/engine/src/flutter/flow/testing/diff_context_test.h
+index 84de5fd175..b6ce621eac 100644
+--- a/engine/src/flutter/flow/testing/diff_context_test.h
++++ b/engine/src/flutter/flow/testing/diff_context_test.h
+@@ -27,11 +27,17 @@ class MockLayerTree {
+   PaintRegionMap& paint_region_map() { return paint_region_map_; }
+   const PaintRegionMap& paint_region_map() const { return paint_region_map_; }
+ 
++  TextureFrameMap& texture_frame_map() { return texture_frame_map_; }
++  const TextureFrameMap& texture_frame_map() const {
++    return texture_frame_map_;
++  }
++
+   const DlISize& size() const { return size_; }
+ 
+  private:
+   std::shared_ptr<ContainerLayer> root_;
+   PaintRegionMap paint_region_map_;
++  TextureFrameMap texture_frame_map_;
+   DlISize size_;
+ };
+ 
+diff --git a/engine/src/flutter/flow/testing/mock_texture.h b/engine/src/flutter/flow/testing/mock_texture.h
+index 936bf065c2..099ab569b3 100644
+--- a/engine/src/flutter/flow/testing/mock_texture.h
++++ b/engine/src/flutter/flow/testing/mock_texture.h
+@@ -32,7 +32,16 @@ class MockTexture : public Texture {
+ 
+   void OnGrContextCreated() override { gr_context_created_ = true; }
+   void OnGrContextDestroyed() override { gr_context_destroyed_ = true; }
+-  void MarkNewFrameAvailable() override {}
++  void MarkNewFrameAvailable() override {
++    if (frame_id_.has_value()) {
++      frame_id_ = NextFrameId();
++    }
++  }
++  std::optional<uint64_t> GetFrameId() const override { return frame_id_; }
++
++  // Makes the texture identify its frames (see Texture::GetFrameId), which
++  // it does not by default.
++  void IdentifyFrames() { frame_id_ = NextFrameId(); }
+   void OnTextureUnregistered() override { unregistered_ = true; }
+ 
+   bool gr_context_created() { return gr_context_created_; }
+@@ -44,6 +53,7 @@ class MockTexture : public Texture {
+   bool gr_context_created_ = false;
+   bool gr_context_destroyed_ = false;
+   bool unregistered_ = false;
++  std::optional<uint64_t> frame_id_;
+ };
+ 
+ }  // namespace testing
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc
+index 61fc5de62c..63a89dfa75 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.cc
+@@ -202,6 +202,12 @@ void EmbedderExternalTextureGL::OnGrContextDestroyed() {}
+ // |flutter::Texture|
+ void EmbedderExternalTextureGL::MarkNewFrameAvailable() {
+   last_image_ = nullptr;
++  frame_id_ = NextFrameId();
++}
++
++// |flutter::Texture|
++std::optional<uint64_t> EmbedderExternalTextureGL::GetFrameId() const {
++  return frame_id_;
+ }
+ 
+ // |flutter::Texture|
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h
+index 3ea22c255d..b46d4f5967 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_gl.h
+@@ -37,12 +37,18 @@ class EmbedderExternalTextureGL : public flutter::Texture {
+   // |flutter::Texture|
+   void MarkNewFrameAvailable() override;
+ 
++  // |flutter::Texture|
++  std::optional<uint64_t> GetFrameId() const override;
++
+   // |flutter::Texture|
+   void OnTextureUnregistered() override;
+ 
+  private:
+   const ExternalTextureCallback& external_texture_callback_;
+   sk_sp<DlImage> last_image_;
++  // The frame |last_image_| is resolved from, kept until the next
++  // |MarkNewFrameAvailable|.
++  uint64_t frame_id_ = NextFrameId();
+ 
+   sk_sp<DlImage> ResolveTexture(int64_t texture_id,
+                                 GrDirectContext* context,
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h
+index c7a57c9fdf..9532332274 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.h
+@@ -39,12 +39,18 @@ class EmbedderExternalTextureMetal : public flutter::Texture {
+   // |flutter::Texture|
+   void MarkNewFrameAvailable() override;
+ 
++  // |flutter::Texture|
++  std::optional<uint64_t> GetFrameId() const override;
++
+   // |flutter::Texture|
+   void OnTextureUnregistered() override;
+ 
+  private:
+   const ExternalTextureCallback& external_texture_callback_;
+   sk_sp<DlImage> last_image_;
++  // The frame |last_image_| is resolved from, kept until the next
++  // |MarkNewFrameAvailable|.
++  uint64_t frame_id_ = NextFrameId();
+ 
+   sk_sp<DlImage> ResolveTexture(int64_t texture_id,
+                                 GrDirectContext* context,
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm
+index a227a70375..3f762de268 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_metal.mm
+@@ -144,6 +144,12 @@ void EmbedderExternalTextureMetal::OnGrContextDestroyed() {}
+ // |flutter::Texture|
+ void EmbedderExternalTextureMetal::MarkNewFrameAvailable() {
+   last_image_ = nullptr;
++  frame_id_ = NextFrameId();
++}
++
++// |flutter::Texture|
++std::optional<uint64_t> EmbedderExternalTextureMetal::GetFrameId() const {
++  return frame_id_;
+ }
+ 
+ // |flutter::Texture|
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc
+index 5e93f3a571..dafe3fce1e 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.cc
+@@ -486,6 +486,12 @@ void EmbedderExternalTextureVulkan::OnGrContextDestroyed() {
+ // |flutter::Texture|
+ void EmbedderExternalTextureVulkan::MarkNewFrameAvailable() {
+   last_image_ = nullptr;
++  frame_id_ = NextFrameId();
++}
++
++// |flutter::Texture|
++std::optional<uint64_t> EmbedderExternalTextureVulkan::GetFrameId() const {
++  return frame_id_;
+ }
+ 
+ // |flutter::Texture|
+diff --git a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h
+index b407d67efc..58fcba5b81 100644
+--- a/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h
++++ b/engine/src/flutter/shell/platform/embedder/embedder_external_texture_vulkan.h
+@@ -90,6 +90,9 @@ class EmbedderExternalTextureVulkan : public flutter::Texture {
+   const ExternalTextureCallback& external_texture_callback_;
+ 
+   sk_sp<DlImage> last_image_;
++  // The frame |last_image_| is resolved from, kept until the next
++  // |MarkNewFrameAvailable|.
++  uint64_t frame_id_ = NextFrameId();
+ 
+   sk_sp<DlImage> ResolveTexture(int64_t texture_id,
+                                 GrDirectContext* context,
+@@ -119,6 +122,9 @@ class EmbedderExternalTextureVulkan : public flutter::Texture {
+   // |flutter::Texture|
+   void MarkNewFrameAvailable() override;
+ 
++  // |flutter::Texture|
++  std::optional<uint64_t> GetFrameId() const override;
++
+   // |flutter::Texture|
+   void OnTextureUnregistered() override;
+ 
+-- 
+2.55.0
+
